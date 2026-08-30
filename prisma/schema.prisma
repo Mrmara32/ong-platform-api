@@ -68,13 +68,11 @@ model Membership {
   @@unique([userId, organizationId])
 }
 
-/**
- * Invitation d'un collaborateur à rejoindre une organisation avec un rôle
- * donné (cf. cahier des charges §2.1 — seul l'Admin/Président peut inviter).
- * L'invité peut déjà avoir un compte utilisateur (autre organisation) ou non ;
- * dans les deux cas, accepter l'invitation crée simplement le Membership
- * correspondant.
- */
+// Invitation d'un collaborateur à rejoindre une organisation avec un rôle
+// donné (cf. cahier des charges §2.1 — seul l'Admin/Président peut inviter).
+// L'invité peut déjà avoir un compte utilisateur (autre organisation) ou non ;
+// dans les deux cas, accepter l'invitation crée simplement le Membership
+// correspondant.
 model Invitation {
   id             String           @id @default(uuid())
   organization   Organization     @relation(fields: [organizationId], references: [id])
@@ -107,14 +105,12 @@ enum Role {
   BAILLEUR_LECTURE
 }
 
-/**
- * Rattachement d'un utilisateur à un projet précis, avec un rôle et une
- * PORTÉE D'ACCÈS propres à ce projet (indépendants de son rôle organisationnel
- * global). C'est ce qui distingue l'espace personnel (COMPLET vs PERSONNEL)
- * — cf. cahier des charges §2.1.1. L'Admin/Président de l'organisation n'a
- * pas besoin d'entrée ici : il a toujours accès complet, vérifié directement
- * via son Membership.role === ADMIN dans le middleware d'accès.
- */
+// Rattachement d'un utilisateur à un projet précis, avec un rôle et une
+// PORTÉE D'ACCÈS propres à ce projet (indépendants de son rôle organisationnel
+// global). C'est ce qui distingue l'espace personnel (COMPLET vs PERSONNEL)
+// — cf. cahier des charges §2.1.1. L'Admin/Président de l'organisation n'a
+// pas besoin d'entrée ici : il a toujours accès complet, vérifié directement
+// via son Membership.role === ADMIN dans le middleware d'accès.
 model ProjectMembership {
   id        String        @id @default(uuid())
   user      User          @relation(fields: [userId], references: [id])
@@ -541,11 +537,9 @@ model VehicleProjectAssignment {
 
 // ---------------- Chauffeurs ----------------
 
-/**
- * Un chauffeur EST un employé de l'organisation — pas une fiche à part.
- * Le lien vers Staff est donc obligatoire (pas de chauffeur "hors RH") ;
- * l'identité (nom, contact) provient de Staff, jamais dupliquée ici.
- */
+// Un chauffeur EST un employé de l'organisation — pas une fiche à part.
+// Le lien vers Staff est donc obligatoire (pas de chauffeur "hors RH") ;
+// l'identité (nom, contact) provient de Staff, jamais dupliquée ici.
 model Driver {
   id                String       @id @default(uuid())
   organization      Organization @relation(fields: [organizationId], references: [id])
