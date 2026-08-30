@@ -1,0 +1,823 @@
+// ==========================================================================
+// Schéma de données — Plateforme multi-tenant de gestion de projets ONG
+// Référentiel comptable : SYCEBNL (OHADA)
+// ==========================================================================
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ---------------- Multi-tenant / Comptes ----------------
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  type      String   // "ONG", "Bailleur", "Prestataire", ...
+  country   String?
+  createdAt DateTime @default(now())
+
+  users        Membership[]
+  projects     Project[]
+  staff        Staff[]
+  suppliers    Supplier[]
+  accounts     ChartOfAccount[]
+  documents    Document[]
+  warehouses   Warehouse[]
+  vehicles     Vehicle[]
+  drivers      Driver[]
+  invoices     Invoice[]
+  payments     Payment[]
+  assets       Asset[]
+  notifications Notification[]
+  invitations  Invitation[]
+  programs           Program[]
+  partneredProjects  ProjectPartner[]
+  sharedResources    SharedResource[]
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  fullName     String
+  passwordHash String
+  createdAt    DateTime @default(now())
+
+  memberships        Membership[]
+  projectMemberships ProjectMembership[]
+  ownedActivities    Activity[]
+  createdExpenses    Expense[]
+  authoredDocuments  Document[]
+  invitationsSent    Invitation[]
+}
+
+// Un utilisateur peut appartenir à plusieurs organisations avec des rôles différents
+model Membership {
+  id             String       @id @default(uuid())
+  user           User         @relation(fields: [userId], references: [id])
+  userId         String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  role           Role
+  createdAt      DateTime     @default(now())
+
+  @@unique([userId, organizationId])
+}
+
+/**
+ * Invitation d'un collaborateur à rejoindre une organisation avec un rôle
+ * donné (cf. cahier des charges §2.1 — seul l'Admin/Président peut inviter).
+ * L'invité peut déjà avoir un compte utilisateur (autre organisation) ou non ;
+ * dans les deux cas, accepter l'invitation crée simplement le Membership
+ * correspondant.
+ */
+model Invitation {
+  id             String           @id @default(uuid())
+  organization   Organization     @relation(fields: [organizationId], references: [id])
+  organizationId String
+  email          String
+  role           Role
+  token          String           @unique
+  status         InvitationStatus @default(EN_ATTENTE)
+  invitedBy      User             @relation(fields: [invitedById], references: [id])
+  invitedById    String
+  createdAt      DateTime         @default(now())
+  expiresAt      DateTime
+}
+
+enum InvitationStatus {
+  EN_ATTENTE
+  ACCEPTEE
+  EXPIREE
+  REVOQUEE
+}
+
+enum Role {
+  ADMIN
+  CHEF_PROJET
+  COMPTABLE
+  LOGISTICIEN
+  RH
+  MEMBRE
+  PARTENAIRE_EXTERNE
+  BAILLEUR_LECTURE
+}
+
+/**
+ * Rattachement d'un utilisateur à un projet précis, avec un rôle et une
+ * PORTÉE D'ACCÈS propres à ce projet (indépendants de son rôle organisationnel
+ * global). C'est ce qui distingue l'espace personnel (COMPLET vs PERSONNEL)
+ * — cf. cahier des charges §2.1.1. L'Admin/Président de l'organisation n'a
+ * pas besoin d'entrée ici : il a toujours accès complet, vérifié directement
+ * via son Membership.role === ADMIN dans le middleware d'accès.
+ */
+model ProjectMembership {
+  id        String        @id @default(uuid())
+  user      User          @relation(fields: [userId], references: [id])
+  userId    String
+  project   Project       @relation(fields: [projectId], references: [id])
+  projectId String
+  role      ProjectRole   @default(MEMBRE)
+  scope     AccessScope   @default(PERSONNEL)
+  createdAt DateTime      @default(now())
+
+  @@unique([userId, projectId])
+}
+
+enum ProjectRole {
+  RESPONSABLE   // chef de projet sur ce projet précis — accès complet par défaut
+  MEMBRE
+  PARTENAIRE
+  LECTURE_SEULE
+}
+
+enum AccessScope {
+  COMPLET     // voit tout le projet
+  PERSONNEL   // ne voit que ce qui lui est propre (activités assignées, dépenses saisies, documents dont il est l'auteur)
+}
+
+// ---------------- Projets & Planification ----------------
+
+model Program {
+  id             String       @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  name           String
+  projects       Project[]
+}
+
+model Project {
+  id             String       @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  program        Program?     @relation(fields: [programId], references: [id])
+  programId      String?
+  name           String
+  code           String       @unique
+  donor          String
+  currency       String       @default("XOF")
+  totalBudget    Decimal
+  startDate      DateTime
+  endDate        DateTime
+  status         ProjectStatus @default(EN_COURS)
+
+  logframe       LogframeResult[]
+  activities     Activity[]
+  budgetLines    BudgetLine[]
+  purchaseOrders PurchaseOrder[]
+  assignments    Assignment[]
+  documents      Document[]
+  sharedWith     ProjectPartner[]
+  stockItems     StockItem[]
+  vehicleAssignments VehicleProjectAssignment[]
+  trips          Trip[]
+  invoices       Invoice[]
+  payments       Payment[]
+  memberships    ProjectMembership[]
+  assets         Asset[]
+  notifications  Notification[]
+  journalEntries JournalEntry[]
+}
+
+enum ProjectStatus {
+  PLANIFICATION
+  EN_COURS
+  SUSPENDU
+  CLOTURE
+}
+
+// Organisations partenaires invitées sur un projet (collaboration inter-ONG)
+model ProjectPartner {
+  id             String       @id @default(uuid())
+  project        Project      @relation(fields: [projectId], references: [id])
+  projectId      String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  invitedAt      DateTime     @default(now())
+
+  @@unique([projectId, organizationId])
+}
+
+model LogframeResult {
+  id          String   @id @default(uuid())
+  project     Project  @relation(fields: [projectId], references: [id])
+  projectId   String
+  objective   String
+  result      String
+  indicator   String
+  target      Float
+  achieved    Float    @default(0)
+}
+
+model Activity {
+  id          String    @id @default(uuid())
+  project     Project   @relation(fields: [projectId], references: [id])
+  projectId   String
+  title       String
+  startDate   DateTime
+  endDate     DateTime
+  progressPct Int       @default(0)
+  status      String    @default("À faire")
+  owner       User?     @relation(fields: [ownerId], references: [id]) // utilisateur responsable — sert de filtre pour l'espace personnel
+  ownerId     String?
+}
+
+// ---------------- Finances & Comptabilité (SYCEBNL) ----------------
+
+model BudgetLine {
+  id          String   @id @default(uuid())
+  project     Project  @relation(fields: [projectId], references: [id])
+  projectId   String
+  code        String   // ex. "61" (classe SYCEBNL)
+  label       String
+  allocated   Decimal
+  spent       Decimal  @default(0)
+
+  expenses       Expense[]
+  disbursements  Disbursement[]
+  purchaseOrders PurchaseOrder[]
+  fuelLogs       FuelLog[]
+  maintenances   Maintenance[]
+  payments       Payment[]
+  assetMaintenances AssetMaintenance[]
+  journalEntries JournalEntry[]
+}
+
+// Plan comptable SYCEBNL propre à chaque organisation
+model ChartOfAccount {
+  id             String       @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  classNumber    Int          // 1 à 8 (classes SYCEBNL)
+  accountCode    String       // ex. "601"
+  label          String
+
+  journalEntries JournalEntry[]
+
+  @@unique([organizationId, accountCode])
+}
+
+model JournalEntry {
+  id          String          @id @default(uuid())
+  account     ChartOfAccount  @relation(fields: [accountId], references: [id])
+  accountId   String
+  project     Project?        @relation(fields: [projectId], references: [id])
+  projectId   String?
+  budgetLine  BudgetLine?     @relation(fields: [budgetLineId], references: [id])
+  budgetLineId String?
+  date        DateTime        @default(now())
+  debit       Decimal         @default(0)
+  credit      Decimal         @default(0)
+  label       String
+  sourceType  JournalSource   // origine de l'écriture
+  sourceId    String?         // id de la dépense / décaissement / livraison liée
+  syncStatus  SyncStatus      @default(SYNCED) // gestion du mode hors-ligne
+}
+
+enum JournalSource {
+  DEPENSE
+  DECAISSEMENT
+  LIVRAISON
+  MANUEL
+}
+
+enum SyncStatus {
+  SYNCED
+  PENDING_SYNC
+  CONFLICT
+}
+
+model Expense {
+  id           String     @id @default(uuid())
+  budgetLine   BudgetLine @relation(fields: [budgetLineId], references: [id])
+  budgetLineId String
+  label        String
+  amount       Decimal
+  date         DateTime   @default(now())
+  status       ExpenseStatus @default(EN_ATTENTE_JUSTIFICATIF)
+  syncStatus   SyncStatus @default(SYNCED)
+  createdBy    User?      @relation(fields: [createdById], references: [id]) // sert de filtre pour l'espace personnel
+  createdById  String?
+}
+
+enum ExpenseStatus {
+  ENGAGE
+  DECAISSE
+  EN_ATTENTE_JUSTIFICATIF
+  JUSTIFIE
+}
+
+model Disbursement {
+  id           String     @id @default(uuid())
+  budgetLine   BudgetLine @relation(fields: [budgetLineId], references: [id])
+  budgetLineId String
+  amount       Decimal
+  date         DateTime   @default(now())
+  method       String     // "Virement", "Espèces", "Mobile money"...
+  syncStatus   SyncStatus @default(SYNCED)
+}
+
+// ---------------- Logistique / Achats ----------------
+
+model Supplier {
+  id             String       @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  name           String
+  contact        String?
+
+  purchaseOrders PurchaseOrder[]
+  payments       Payment[]
+}
+
+model PurchaseOrder {
+  id           String       @id @default(uuid())
+  project      Project      @relation(fields: [projectId], references: [id])
+  projectId    String
+  budgetLine   BudgetLine   @relation(fields: [budgetLineId], references: [id])
+  budgetLineId String
+  supplier     Supplier     @relation(fields: [supplierId], references: [id])
+  supplierId   String
+  item         String
+  amount       Decimal
+  status       OrderStatus  @default(COMMANDE)
+  createdAt    DateTime     @default(now())
+  deliveredAt  DateTime?
+}
+
+enum OrderStatus {
+  COMMANDE
+  LIVRE
+  COMPTABILISE
+}
+
+// ---------------- Facturation ----------------
+
+model Invoice {
+  id             String        @id @default(uuid())
+  organization   Organization  @relation(fields: [organizationId], references: [id])
+  organizationId String
+  project        Project?      @relation(fields: [projectId], references: [id])
+  projectId      String?
+  number         String        // numérotation séquentielle, unique par organisation
+  clientName     String        // partenaire/client facturé pour la prestation
+  currency       String        @default("XOF")
+  issueDate      DateTime      @default(now())
+  dueDate        DateTime
+  status         InvoiceStatus @default(EMISE)
+
+  lines    InvoiceLine[]
+  payments Payment[]
+
+  @@unique([organizationId, number])
+}
+
+model InvoiceLine {
+  id          String  @id @default(uuid())
+  invoice     Invoice @relation(fields: [invoiceId], references: [id])
+  invoiceId   String
+  description String  // prestation facturée
+  quantity    Decimal @default(1)
+  unitPrice   Decimal
+}
+
+enum InvoiceStatus {
+  EMISE
+  ENVOYEE
+  PAYEE
+  EN_RETARD
+  ANNULEE
+}
+
+// ---------------- Paiements multicanal ----------------
+// Modèle générique pour tout paiement sortant (fournisseur, prestataire, salaire)
+// ou entrant (encaissement d'une facture émise), quel que soit le canal utilisé.
+
+model Payment {
+  id             String           @id @default(uuid())
+  organization   Organization     @relation(fields: [organizationId], references: [id])
+  organizationId String
+  project        Project?         @relation(fields: [projectId], references: [id])
+  projectId      String?
+  budgetLine     BudgetLine?      @relation(fields: [budgetLineId], references: [id])
+  budgetLineId   String?
+  direction      PaymentDirection
+  method         PaymentMethod
+  amount         Decimal
+  reference      String?          // n° de transaction mobile money / référence de virement
+  status         PaymentStatus    @default(CONFIRME)
+  date           DateTime         @default(now())
+  syncStatus     SyncStatus       @default(SYNCED)
+
+  // Origine du paiement (une seule de ces relations est renseignée selon le cas)
+  supplier       Supplier?        @relation(fields: [supplierId], references: [id])
+  supplierId     String?
+  staff          Staff?           @relation(fields: [staffId], references: [id])
+  staffId        String?
+  invoice        Invoice?         @relation(fields: [invoiceId], references: [id])
+  invoiceId      String?
+  payslip        Payslip?         @relation(fields: [payslipId], references: [id])
+  payslipId      String?
+}
+
+enum PaymentDirection {
+  SORTANT // l'organisation paie (fournisseur, prestataire, salaire)
+  ENTRANT // l'organisation encaisse (règlement d'une facture émise)
+}
+
+enum PaymentMethod {
+  VIREMENT
+  ORANGE_MONEY
+  MTN_MONEY
+  MOOV_MONEY
+  WAVE
+  ESPECES
+  CHEQUE
+}
+
+enum PaymentStatus {
+  INITIE
+  CONFIRME
+  ECHOUE
+}
+
+// ---------------- Gestion des stocks ----------------
+
+model Warehouse {
+  id             String       @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  name           String
+  location       String?
+
+  stockItems StockItem[]
+}
+
+model StockItem {
+  id          String       @id @default(uuid())
+  warehouse   Warehouse    @relation(fields: [warehouseId], references: [id])
+  warehouseId String
+  project     Project?     @relation(fields: [projectId], references: [id])
+  projectId   String?
+  name        String
+  unit        String       // "kg", "unité", "litre", ...
+  quantity    Decimal      @default(0)
+  minQuantity Decimal      @default(0) // seuil d'alerte
+  unitCost    Decimal      @default(0)
+
+  movements StockMovement[]
+}
+
+model StockMovement {
+  id          String       @id @default(uuid())
+  stockItem   StockItem    @relation(fields: [stockItemId], references: [id])
+  stockItemId String
+  type        MovementType
+  quantity    Decimal
+  reason      String?      // ex. "Réception CMD-001", "Distribution activité X"
+  date        DateTime     @default(now())
+}
+
+enum MovementType {
+  ENTREE
+  SORTIE
+  TRANSFERT
+}
+
+// ---------------- Parc de véhicules ----------------
+
+model Vehicle {
+  id             String        @id @default(uuid())
+  organization   Organization  @relation(fields: [organizationId], references: [id])
+  organizationId String
+  type           VehicleType   @default(VOITURE) // voiture, moto, engin lourd (tracteur, groupe mobile...)
+  plateNumber    String        @unique
+  brand          String
+  model          String
+  acquiredAt     DateTime?
+  status         VehicleStatus @default(DISPONIBLE)
+  currentMileage Int           @default(0) // pour un ENGIN sans compteur km, utiliser les heures moteur (champ engineHours)
+  engineHours    Int?          // pertinent pour les engins (tracteurs, groupes électrogènes mobiles...) plutôt que le km
+
+  // Affectation permanente d'un chauffeur (employé) à ce véhicule/moto/engin —
+  // distincte du chauffeur d'un trajet ponctuel (Trip.driverId), qui peut
+  // exceptionnellement différer (remplacement, alternance...).
+  assignedDriver   Driver? @relation(fields: [assignedDriverId], references: [id])
+  assignedDriverId String?
+
+  trips        Trip[]
+  fuelLogs     FuelLog[]
+  maintenances Maintenance[]
+  assignments  VehicleProjectAssignment[]
+}
+
+enum VehicleType {
+  VOITURE
+  MOTO
+  ENGIN
+  AUTRE
+}
+
+enum VehicleStatus {
+  DISPONIBLE
+  EN_MISSION
+  EN_MAINTENANCE
+  HORS_SERVICE
+}
+
+// Affectation d'un véhicule à un ou plusieurs projets (usage partagé)
+model VehicleProjectAssignment {
+  id        String  @id @default(uuid())
+  vehicle   Vehicle @relation(fields: [vehicleId], references: [id])
+  vehicleId String
+  project   Project @relation(fields: [projectId], references: [id])
+  projectId String
+  sharePct  Int     @default(100) // répartition du coût si usage partagé entre projets
+}
+
+// ---------------- Chauffeurs ----------------
+
+/**
+ * Un chauffeur EST un employé de l'organisation — pas une fiche à part.
+ * Le lien vers Staff est donc obligatoire (pas de chauffeur "hors RH") ;
+ * l'identité (nom, contact) provient de Staff, jamais dupliquée ici.
+ */
+model Driver {
+  id                String       @id @default(uuid())
+  organization      Organization @relation(fields: [organizationId], references: [id])
+  organizationId    String
+  staff             Staff        @relation(fields: [staffId], references: [id])
+  staffId           String       @unique // un employé ne peut avoir qu'une seule fiche chauffeur
+  licenseNumber     String
+  licenseExpiryDate DateTime
+
+  trips Trip[]
+  assignedVehicles Vehicle[]
+}
+
+// ---------------- Déplacements (carnet de bord) ----------------
+
+model Trip {
+  id             String    @id @default(uuid())
+  vehicle        Vehicle   @relation(fields: [vehicleId], references: [id])
+  vehicleId      String
+  driver         Driver    @relation(fields: [driverId], references: [id])
+  driverId       String
+  project        Project?  @relation(fields: [projectId], references: [id])
+  projectId      String?
+  purpose        String
+  route          String?
+  startMileage   Int
+  endMileage     Int?
+  departureDate  DateTime
+  returnDate     DateTime?
+}
+
+// ---------------- Carburant ----------------
+
+model FuelLog {
+  id           String     @id @default(uuid())
+  vehicle      Vehicle    @relation(fields: [vehicleId], references: [id])
+  vehicleId    String
+  budgetLine   BudgetLine? @relation(fields: [budgetLineId], references: [id])
+  budgetLineId String?
+  date         DateTime   @default(now())
+  liters       Decimal
+  cost         Decimal
+  mileage      Int        // kilométrage au moment du plein
+  syncStatus   SyncStatus @default(SYNCED)
+}
+
+// ---------------- Maintenance ----------------
+
+model Maintenance {
+  id           String          @id @default(uuid())
+  vehicle      Vehicle         @relation(fields: [vehicleId], references: [id])
+  vehicleId    String
+  budgetLine   BudgetLine?     @relation(fields: [budgetLineId], references: [id])
+  budgetLineId String?
+  type         MaintenanceType
+  date         DateTime        @default(now())
+  mileage      Int
+  provider     String?
+  description  String?
+  cost         Decimal
+  nextDueDate  DateTime?       // prochaine échéance (préventive)
+  nextDueKm    Int?
+}
+
+enum MaintenanceType {
+  PREVENTIVE
+  CURATIVE
+}
+
+// ---------------- Matériel divers (informatique et autres équipements) ----------------
+// Registre générique pour tout ce qui n'est pas un véhicule/moto : PC,
+// imprimantes, groupes électrogènes, etc. — cf. cahier des charges §2.5.7bis.
+
+model Asset {
+  id             String        @id @default(uuid())
+  organization   Organization  @relation(fields: [organizationId], references: [id])
+  organizationId String
+  project        Project?      @relation(fields: [projectId], references: [id])
+  projectId      String?
+  category       AssetCategory
+  name           String        // ex. "PC portable — bureau Niamey", "Groupe électrogène 5kVA"
+  serialNumber   String?
+  acquiredAt     DateTime?
+  warrantyEnd    DateTime?
+  status         AssetStatus   @default(EN_SERVICE)
+
+  maintenances AssetMaintenance[]
+}
+
+enum AssetCategory {
+  INFORMATIQUE
+  GENERATEUR
+  MOBILIER_BUREAU
+  EQUIPEMENT_TERRAIN
+  AUTRE
+}
+
+enum AssetStatus {
+  EN_SERVICE
+  EN_MAINTENANCE
+  HORS_SERVICE
+  REFORME
+}
+
+model AssetMaintenance {
+  id           String              @id @default(uuid())
+  asset        Asset               @relation(fields: [assetId], references: [id])
+  assetId      String
+  budgetLine   BudgetLine?         @relation(fields: [budgetLineId], references: [id])
+  budgetLineId String?
+  type         AssetMaintenanceType
+  date         DateTime            @default(now())
+  provider     String?
+  description  String?             // ex. "Renouvellement licence antivirus 1 an"
+  cost         Decimal             @default(0)
+  nextDueDate  DateTime?           // prochaine échéance (entretien préventif ou renouvellement de licence)
+}
+
+enum AssetMaintenanceType {
+  PREVENTIVE
+  CURATIVE
+  RENOUVELLEMENT_LICENCE // ex. antivirus, logiciel sous abonnement
+}
+
+// ---------------- Alertes / Notifications ----------------
+// Alerte générée pour toute échéance de maintenance (véhicule, moto, ou
+// matériel divers) approchant ou dépassée, notifiée en priorité au
+// Logisticien et à l'Admin/Président — cf. cahier des charges §2.5.7ter.
+
+model Notification {
+  id             String               @id @default(uuid())
+  organization   Organization         @relation(fields: [organizationId], references: [id])
+  organizationId String
+  project        Project?             @relation(fields: [projectId], references: [id]) // renseigné pour une panne : le(s) projet(s) impacté(s)
+  projectId      String?
+  type           NotificationType
+  message        String
+  dueAt          DateTime             // date/échéance concernée par l'alerte
+  urgency        NotificationUrgency
+  resourceType   String               // "Vehicle" | "Asset"
+  resourceId     String               // id du véhicule ou du matériel concerné
+  status         NotificationStatus   @default(EN_ATTENTE)
+  createdAt      DateTime             @default(now())
+  acknowledgedAt DateTime?
+
+  @@unique([resourceType, resourceId, type, dueAt])
+}
+
+enum NotificationType {
+  MAINTENANCE_VEHICULE
+  MAINTENANCE_MATERIEL
+  RENOUVELLEMENT_LICENCE
+  PANNE_VEHICULE
+}
+
+enum NotificationUrgency {
+  A_VENIR     // échéance dans plus de 15 jours / 1000 km
+  IMMINENTE   // échéance sous 15 jours / 1000 km
+  DEPASSEE
+}
+
+enum NotificationStatus {
+  EN_ATTENTE
+  TRAITEE
+}
+
+// ---------------- Ressources Humaines ----------------
+
+model Staff {
+  id             String       @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  fullName       String
+  jobTitle       String
+  monthlyCost    Decimal
+  email          String?
+  phone          String?      // utilisé pour le partage du bulletin de paie via WhatsApp
+
+  assignments Assignment[]
+  payments    Payment[]
+  payslips    Payslip[]
+  driverProfile Driver?
+}
+
+model Assignment {
+  id        String  @id @default(uuid())
+  staff     Staff   @relation(fields: [staffId], references: [id])
+  staffId   String
+  project   Project @relation(fields: [projectId], references: [id])
+  projectId String
+  allocPct  Int     // taux d'affectation (%)
+  startDate DateTime
+  endDate   DateTime?
+}
+
+// ---------------- Paie ----------------
+
+model Payslip {
+  id           String    @id @default(uuid())
+  staff        Staff     @relation(fields: [staffId], references: [id])
+  staffId      String
+  period       String    // format "YYYY-MM"
+  baseSalary   Decimal
+  bonuses      Decimal   @default(0)
+  deductions   Decimal   @default(0)
+  netPay       Decimal   // baseSalary + bonuses - deductions
+  status       PayslipStatus @default(GENERE)
+  generatedAt  DateTime  @default(now())
+  sharedVia    String[]  @default([]) // ex. ["email", "whatsapp"]
+
+  payments Payment[]
+
+  @@unique([staffId, period])
+}
+
+enum PayslipStatus {
+  GENERE
+  PAYE
+  PARTAGE
+}
+
+// ---------------- Documents & Partage ----------------
+
+model Document {
+  id             String       @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  project        Project?     @relation(fields: [projectId], references: [id])
+  projectId      String?
+  title          String
+  type           DocumentType
+  content        String       // stockage du contenu ou référence vers un fichier (S3)
+  visibility     Visibility   @default(PRIVE)
+  createdAt      DateTime     @default(now())
+  author         User?        @relation(fields: [authorId], references: [id]) // sert de filtre pour l'espace personnel
+  authorId       String?
+
+  sharedWith SharedResource[]
+}
+
+enum DocumentType {
+  TDR
+  RAPPORT_ACTIVITE
+  RAPPORT_FINANCIER
+  AUTRE
+}
+
+enum Visibility {
+  PRIVE
+  PARTAGE
+}
+
+// Partage explicite d'un document avec une organisation partenaire sur un projet donné
+model SharedResource {
+  id             String       @id @default(uuid())
+  document       Document     @relation(fields: [documentId], references: [id])
+  documentId     String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  sharedAt       DateTime     @default(now())
+
+  @@unique([documentId, organizationId])
+}
+
+// ---------------- Traçabilité ----------------
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String
+  action    String
+  entity    String
+  entityId  String
+  timestamp DateTime @default(now())
+  metadata  Json?
+}
