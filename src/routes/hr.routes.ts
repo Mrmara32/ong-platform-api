@@ -37,6 +37,8 @@ const assignmentSchema = z.object({
   allocPct: z.number().int().min(1).max(100),
   startDate: z.string(),
   endDate: z.string().optional(),
+  monthlyRate: z.number().nonnegative().optional(), // taux propre à cette affectation (consultant), sinon calculé depuis staff.monthlyCost
+  role: z.string().optional(), // fonction sur ce projet précis, si différente de l'intitulé de poste habituel
 });
 
 hrRouter.post("/assignments", requireRole("ADMIN", "RH"), async (req, res) => {
@@ -51,21 +53,28 @@ hrRouter.post("/assignments", requireRole("ADMIN", "RH"), async (req, res) => {
       allocPct: data.allocPct,
       startDate: new Date(data.startDate),
       endDate: data.endDate ? new Date(data.endDate) : undefined,
+      monthlyRate: data.monthlyRate,
+      role: data.role,
     },
   });
   res.status(201).json(assignment);
 });
 
-// Coût mensuel de personnel imputé à un projet — utile pour le tableau de bord RH
+/**
+ * Coût mensuel de personnel imputé à un projet. Un consultant/expert
+ * affecté avec un taux de rémunération propre à ce projet (monthlyRate)
+ * utilise ce taux directement ; sinon, le calcul par défaut s'applique
+ * (coût de base de l'employé × son taux d'affectation).
+ */
 hrRouter.get("/projects/:projectId/staffing-cost", async (req, res) => {
   const assignments = await prisma.assignment.findMany({
     where: { projectId: req.params.projectId },
     include: { staff: true },
   });
-  const totalMonthlyCost = assignments.reduce(
-    (sum, a) => sum + (Number(a.staff.monthlyCost) * a.allocPct) / 100,
-    0
-  );
+  const totalMonthlyCost = assignments.reduce((sum, a) => {
+    const cost = a.monthlyRate != null ? Number(a.monthlyRate) : (Number(a.staff.monthlyCost) * a.allocPct) / 100;
+    return sum + cost;
+  }, 0);
   res.json({ assignments, totalMonthlyCost });
 });
 

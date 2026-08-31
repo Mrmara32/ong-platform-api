@@ -16,6 +16,7 @@ import { membersRouter } from "./routes/members.routes";
 import { organizationsRouter } from "./routes/organizations.routes";
 import { financialStatementsRouter } from "./routes/financial-statements.routes";
 import { paymentRequestsRouter, lettersRouter } from "./routes/payment-requests.routes";
+import { donorAllocationsRouter } from "./routes/donor-allocations.routes";
 
 const app = express();
 app.use(cors());
@@ -46,6 +47,7 @@ app.use("/api/members", membersRouter);
 app.use("/api/organizations", organizationsRouter);
 app.use("/api/financial-statements", financialStatementsRouter);
 app.use("/api/payment-requests", paymentRequestsRouter);
+app.use("/api/projects", donorAllocationsRouter);
 app.use("/api/letters", lettersRouter);
 
 const PORT = process.env.PORT || 4000;

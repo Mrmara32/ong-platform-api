@@ -235,3 +235,175 @@ projectsRouter.delete("/:id/members/:userId", async (req, res) => {
   });
   res.status(204).send();
 });
+
+// ---------------------------------------------------------------------------
+// Cadre logique — matrice d'indicateurs (objectifs, résultats, activités)
+// ---------------------------------------------------------------------------
+
+const logframeSchema = z.object({
+  objective: z.string().min(2),
+  result: z.string().min(2),
+  indicator: z.string().min(2),
+  target: z.number().positive(),
+});
+
+/** Ajoute un indicateur à la matrice du cadre logique du projet. */
+projectsRouter.post("/:id/logframe", async (req, res) => {
+  const parsed = logframeSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const project = await prisma.project.findFirst({
+    where: { id: req.params.id, organizationId: req.auth!.organizationId },
+  });
+  if (!project) return res.status(404).json({ error: "Projet introuvable" });
+
+  const access = await resolveProjectAccess(req.auth!, project.id);
+  if (!access.canAccess || access.scope !== "COMPLET") {
+    return res.status(403).json({ error: "Seul un accès complet au projet permet de gérer le cadre logique" });
+  }
+
+  const indicator = await prisma.logframeResult.create({
+    data: { projectId: project.id, ...parsed.data },
+  });
+  res.status(201).json(indicator);
+});
+
+const logframeUpdateSchema = z.object({
+  achieved: z.number().nonnegative().optional(),
+  target: z.number().positive().optional(),
+});
+
+/** Met à jour la valeur atteinte d'un indicateur — c'est ici que le suivi périodique se fait. */
+projectsRouter.patch("/logframe/:logframeId", async (req, res) => {
+  const parsed = logframeUpdateSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  if (Object.keys(parsed.data).length === 0) return res.status(400).json({ error: "Aucun champ à mettre à jour" });
+
+  const indicator = await prisma.logframeResult.findFirst({
+    where: { id: req.params.logframeId, project: { organizationId: req.auth!.organizationId } },
+  });
+  if (!indicator) return res.status(404).json({ error: "Indicateur introuvable" });
+
+  const access = await resolveProjectAccess(req.auth!, indicator.projectId);
+  if (!access.canAccess || access.scope !== "COMPLET") {
+    return res.status(403).json({ error: "Seul un accès complet au projet permet de mettre à jour le cadre logique" });
+  }
+
+  const updated = await prisma.logframeResult.update({ where: { id: indicator.id }, data: parsed.data });
+  res.json(updated);
+});
+
+projectsRouter.delete("/logframe/:logframeId", async (req, res) => {
+  const indicator = await prisma.logframeResult.findFirst({
+    where: { id: req.params.logframeId, project: { organizationId: req.auth!.organizationId } },
+  });
+  if (!indicator) return res.status(404).json({ error: "Indicateur introuvable" });
+
+  const access = await resolveProjectAccess(req.auth!, indicator.projectId);
+  if (!access.canAccess || access.scope !== "COMPLET") {
+    return res.status(403).json({ error: "Seul un accès complet au projet permet de gérer le cadre logique" });
+  }
+
+  await prisma.logframeResult.delete({ where: { id: indicator.id } });
+  res.status(204).send();
+});
+
+// ---------------------------------------------------------------------------
+// Collecte de données terrain — mises à jour d'activités
+// ---------------------------------------------------------------------------
+
+const activityUpdateSchema = z.object({
+  note: z.string().min(3),
+  beneficiariesReached: z.number().int().nonnegative().optional(),
+  progressPct: z.number().int().min(0).max(100).optional(),
+});
+
+/**
+ * Formulaire de remontée terrain — tout utilisateur ayant accès à
+ * l'activité peut soumettre une mise à jour (avancement, bénéficiaires
+ * touchés, observations), sans attendre un rapport formel. Si un
+ * pourcentage d'avancement est fourni, il met aussi à jour l'activité
+ * elle-même.
+ */
+projectsRouter.post("/activities/:activityId/updates", async (req, res) => {
+  const parsed = activityUpdateSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const activity = await prisma.activity.findFirst({
+    where: { id: req.params.activityId, project: { organizationId: req.auth!.organizationId } },
+  });
+  if (!activity) return res.status(404).json({ error: "Activité introuvable" });
+
+  const access = await resolveProjectAccess(req.auth!, activity.projectId);
+  if (!access.canAccess) return res.status(403).json({ error: "Aucun accès à ce projet" });
+
+  const update = await prisma.activityUpdate.create({
+    data: { activityId: activity.id, submittedById: req.auth!.userId, ...parsed.data },
+  });
+
+  if (parsed.data.progressPct !== undefined) {
+    await prisma.activity.update({ where: { id: activity.id }, data: { progressPct: parsed.data.progressPct } });
+  }
+
+  res.status(201).json(update);
+});
+
+projectsRouter.get("/activities/:activityId/updates", async (req, res) => {
+  const activity = await prisma.activity.findFirst({
+    where: { id: req.params.activityId, project: { organizationId: req.auth!.organizationId } },
+  });
+  if (!activity) return res.status(404).json({ error: "Activité introuvable" });
+
+  const access = await resolveProjectAccess(req.auth!, activity.projectId);
+  if (!access.canAccess) return res.status(403).json({ error: "Aucun accès à ce projet" });
+
+  const updates = await prisma.activityUpdate.findMany({
+    where: { activityId: activity.id },
+    orderBy: { date: "desc" },
+  });
+  res.json(updates);
+});
+
+// ---------------------------------------------------------------------------
+// Tableau de bord d'impact — évolution des bénéficiaires en temps réel
+// ---------------------------------------------------------------------------
+
+/**
+ * Agrège toutes les remontées terrain d'un projet pour visualiser
+ * l'évolution cumulée des bénéficiaires touchés dans le temps — c'est le
+ * "temps réel" demandé : chaque mise à jour terrain alimente immédiatement
+ * ce tableau de bord, sans attendre un rapport de fin de projet.
+ */
+projectsRouter.get("/:id/impact-dashboard", async (req, res) => {
+  const project = await prisma.project.findFirst({
+    where: { id: req.params.id, organizationId: req.auth!.organizationId },
+  });
+  if (!project) return res.status(404).json({ error: "Projet introuvable" });
+
+  const access = await resolveProjectAccess(req.auth!, project.id);
+  if (!access.canAccess) return res.status(403).json({ error: "Aucun accès à ce projet" });
+
+  const updates = await prisma.activityUpdate.findMany({
+    where: { activity: { projectId: project.id }, beneficiariesReached: { not: null } },
+    orderBy: { date: "asc" },
+    include: { activity: { select: { title: true } } },
+  });
+
+  let cumulative = 0;
+  const timeline = updates.map((u) => {
+    cumulative += u.beneficiariesReached ?? 0;
+    return {
+      date: u.date,
+      activityTitle: u.activity.title,
+      beneficiariesReached: u.beneficiariesReached,
+      cumulativeBeneficiaries: cumulative,
+      note: u.note,
+    };
+  });
+
+  res.json({
+    totalBeneficiaries: cumulative,
+    totalUpdates: updates.length,
+    timeline,
+  });
+});
