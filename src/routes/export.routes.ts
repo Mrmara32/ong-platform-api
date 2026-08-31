@@ -1,10 +1,11 @@
 import { Router, Request } from "express";
+import { z } from "zod";
 import PDFDocument from "pdfkit";
 import ExcelJS from "exceljs";
 import { Document as DocxDocument, Packer, Paragraph, HeadingLevel, TextRun } from "docx";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
-import { generatePayslipPdfBuffer, generateInvoicePdfBuffer, generatePurchaseOrderPdfBuffer, generatePaymentRequestPdfBuffer, generateLetterPdfBuffer } from "../services/pdf.service";
+import { generatePayslipPdfBuffer, generateInvoicePdfBuffer, generatePurchaseOrderPdfBuffer, generatePaymentRequestPdfBuffer, generateLetterPdfBuffer, generateDonorReportPdfBuffer, DonorReportFormat } from "../services/pdf.service";
 import { purchaseOrderNumber } from "../services/invoice-numbering.service";
 
 export const exportRouter = Router();
@@ -351,3 +352,40 @@ exportRouter.get("/vehicles/xlsx", async (req, res) => {
 function slug(title: string) {
   return title.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").slice(0, 60);
 }
+
+// ---------------------------------------------------------------------------
+// Rapport bailleur (UE / ONU / USAID) — export PDF
+// ---------------------------------------------------------------------------
+
+const donorReportSchema = z.object({
+  format: z.enum(["UE", "ONU", "USAID", "GENERIQUE"]).default("GENERIQUE"),
+  periodLabel: z.string().min(2),
+  narrative: z.string().min(10),
+  challenges: z.string().optional(),
+});
+
+exportRouter.post("/projects/:id/donor-report-pdf", async (req, res) => {
+  const parsed = donorReportSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const project = await prisma.project.findFirst({
+    where: { id: req.params.id, organizationId: req.auth!.organizationId },
+    include: { organization: true, logframe: true, budgetLines: true },
+  });
+  if (!project) return res.status(404).json({ error: "Projet introuvable" });
+
+  const buffer = await generateDonorReportPdfBuffer({
+    format: parsed.data.format as DonorReportFormat,
+    periodLabel: parsed.data.periodLabel,
+    narrative: parsed.data.narrative,
+    challenges: parsed.data.challenges,
+    project: { name: project.name, code: project.code, donor: project.donor, grantNumber: project.grantNumber, currency: project.currency },
+    logframe: project.logframe.map((l) => ({ objective: l.objective, result: l.result, indicator: l.indicator, target: l.target, achieved: l.achieved })),
+    budgetLines: project.budgetLines.map((l) => ({ code: l.code, label: l.label, allocated: Number(l.allocated), spent: Number(l.spent) })),
+    organization: project.organization,
+  });
+
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `${pdfDisposition(req)}; filename="rapport-${parsed.data.format.toLowerCase()}-${project.code}.pdf"`);
+  res.send(buffer);
+});

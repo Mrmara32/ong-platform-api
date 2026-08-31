@@ -89,3 +89,27 @@ organizationsRouter.delete("/bank-accounts/:id", requireRole("ADMIN"), async (re
   await prisma.bankAccount.delete({ where: { id: account.id } });
   res.status(204).send();
 });
+
+// -------- Bailleurs (répertoire au niveau organisation) --------
+
+organizationsRouter.get("/donors", async (req, res) => {
+  const donors = await prisma.donor.findMany({
+    where: { organizationId: req.auth!.organizationId },
+    orderBy: { name: "asc" },
+  });
+  res.json(donors);
+});
+
+const donorSchema = z.object({
+  name: z.string().min(2),
+  contactName: z.string().optional(),
+  contactEmail: z.string().email().optional(),
+  contactPhone: z.string().optional(),
+});
+
+organizationsRouter.post("/donors", requireRole("ADMIN", "CHEF_PROJET"), async (req, res) => {
+  const parsed = donorSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const donor = await prisma.donor.create({ data: { ...parsed.data, organizationId: req.auth!.organizationId } });
+  res.status(201).json(donor);
+});
