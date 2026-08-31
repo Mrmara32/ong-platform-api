@@ -1,9 +1,11 @@
 import { Router } from "express";
 import crypto from "crypto";
+import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { prisma } from "../lib/prisma";
 import { requireAuth, requireRole } from "../middleware/auth";
 import { sendMail } from "../lib/mailer";
+import { logAudit } from "../services/audit.service";
 
 export const membersRouter = Router();
 membersRouter.use(requireAuth);
@@ -66,6 +68,54 @@ membersRouter.post("/invite", requireRole("ADMIN"), async (req, res) => {
   res.status(201).json({ invitation, acceptUrl, simulated: mailResult.simulated });
 });
 
+const createAccountSchema = z.object({
+  email: z.string().email(),
+  fullName: z.string().min(2),
+  password: z.string().min(6),
+  role: z.enum(["ADMIN", "CHEF_PROJET", "COMPTABLE", "LOGISTICIEN", "RH", "MEMBRE", "PARTENAIRE_EXTERNE", "BAILLEUR_LECTURE"]),
+});
+
+/**
+ * Crée directement un compte utilisateur avec mot de passe et rôle choisis
+ * par l'Admin — sans passer par le circuit d'invitation par email. Utile
+ * quand l'Admin veut créer les comptes lui-même (ex. connectivité limitée
+ * de l'employé, ou volonté de tout contrôler depuis le départ), plutôt que
+ * de dépendre d'un email d'invitation à accepter. Seul l'Admin/Président
+ * peut créer des comptes et choisir leur rôle.
+ */
+membersRouter.post("/create-account", requireRole("ADMIN"), async (req, res) => {
+  const parsed = createAccountSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const { email, fullName, password, role } = parsed.data;
+
+  const existingUser = await prisma.user.findUnique({ where: { email } });
+  if (existingUser) {
+    const existingMembership = await prisma.membership.findFirst({
+      where: { organizationId: req.auth!.organizationId, userId: existingUser.id },
+    });
+    if (existingMembership) return res.status(409).json({ error: "Cette personne est déjà membre de l'organisation" });
+  }
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  const user = existingUser ?? (await prisma.user.create({ data: { email, fullName, passwordHash } }));
+
+  const membership = await prisma.membership.create({
+    data: { userId: user.id, organizationId: req.auth!.organizationId, role },
+    include: { user: { select: { id: true, fullName: true, email: true } } },
+  });
+
+  await logAudit({
+    userId: req.auth!.userId,
+    organizationId: req.auth!.organizationId,
+    action: "CREATE_ACCOUNT",
+    entity: "User",
+    entityId: user.id,
+    metadata: { email, role, createdBy: "admin_direct" },
+  });
+
+  res.status(201).json(membership);
+});
+
 membersRouter.delete("/invitations/:id", requireRole("ADMIN"), async (req, res) => {
   const invitation = await prisma.invitation.findFirst({
     where: { id: req.params.id, organizationId: req.auth!.organizationId },
@@ -100,6 +150,14 @@ membersRouter.patch("/:userId/role", requireRole("ADMIN"), async (req, res) => {
   }
 
   const updated = await prisma.membership.update({ where: { id: membership.id }, data: { role: parsed.data.role } });
+  await logAudit({
+    userId: req.auth!.userId,
+    organizationId: req.auth!.organizationId,
+    action: "CHANGE_ROLE",
+    entity: "Membership",
+    entityId: membership.id,
+    metadata: { targetUserId: membership.userId, oldRole: membership.role, newRole: parsed.data.role },
+  });
   res.json(updated);
 });
 
@@ -120,5 +178,27 @@ membersRouter.delete("/:userId", requireRole("ADMIN"), async (req, res) => {
   }
 
   await prisma.membership.delete({ where: { id: membership.id } });
+  await logAudit({
+    userId: req.auth!.userId,
+    organizationId: req.auth!.organizationId,
+    action: "REMOVE_MEMBER",
+    entity: "Membership",
+    entityId: membership.id,
+    metadata: { targetUserId: membership.userId, role: membership.role },
+  });
   res.status(204).send();
+});
+
+/**
+ * Piste d'audit — historique complet des actions sensibles, réservé à
+ * l'Admin/Président. Garantit la transparence et l'intégrité des données
+ * exigée par les bailleurs (traçabilité de qui a fait quoi et quand).
+ */
+membersRouter.get("/audit-log", requireRole("ADMIN"), async (req, res) => {
+  const logs = await prisma.auditLog.findMany({
+    where: { organizationId: req.auth!.organizationId },
+    orderBy: { timestamp: "desc" },
+    take: 300,
+  });
+  res.json(logs);
 });

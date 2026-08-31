@@ -25,9 +25,10 @@ model Organization {
   phone              String?
   email              String?
   website            String?
-  bankName           String?  // ex. BICIGUI — imprimé sur les demandes de paiement aux bailleurs
+  bankName           String?  // compte par défaut (rétrocompatibilité) — préférer bankAccounts pour une ONG à plusieurs comptes
   bankAddress        String?
   bankAccountNumber  String?
+  bankAccounts       BankAccount[]
   logoUrl            String?  // logo (data URL base64 ou lien hébergé) imprimé sur bulletins, factures, TDR...
   createdAt          DateTime @default(now())
 
@@ -35,6 +36,8 @@ model Organization {
   projects     Project[]
   staff        Staff[]
   letterTemplates LetterTemplate[]
+  auditLogs       AuditLog[]
+  exchangeRates   ExchangeRate[]
   suppliers    Supplier[]
   accounts     ChartOfAccount[]
   documents    Document[]
@@ -989,13 +992,35 @@ model SharedResource {
 // ---------------- Traçabilité ----------------
 
 model AuditLog {
-  id        String   @id @default(uuid())
-  userId    String
-  action    String
-  entity    String
-  entityId  String
-  timestamp DateTime @default(now())
-  metadata  Json?
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  userId         String
+  userName       String       // capturé au moment de l'action — reste lisible même si l'utilisateur est supprimé plus tard
+  action         String       // "CREATE" | "UPDATE" | "DELETE" | "APPROVE" | "REJECT" | ...
+  entity         String       // ex. "PurchaseOrder", "PaymentRequest"
+  entityId       String
+  timestamp      DateTime     @default(now())
+  metadata       Json?        // détail (ex. { before, after } ou champs modifiés)
+}
+
+// Taux de change saisi manuellement par le Comptable — permet la
+// conversion entre devises (GNF/USD/EUR) pour les missions internationales
+// et les rapports consolidés multi-devises. Volontairement manuel plutôt
+// qu'automatique : un taux de change appliqué à un projet financé par
+// subvention doit être celui négocié/approuvé avec le bailleur, pas un taux
+// de marché flottant récupéré en temps réel.
+model ExchangeRate {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  fromCurrency   String
+  toCurrency     String
+  rate           Decimal      // 1 unité de fromCurrency = `rate` unités de toCurrency
+  effectiveDate  DateTime     @default(now())
+  setById        String?
+
+  @@index([organizationId, fromCurrency, toCurrency, effectiveDate])
 }
 
 // Demande de paiement adressée au bailleur — format calqué sur les
@@ -1007,6 +1032,8 @@ model PaymentRequest {
   id               String               @id @default(uuid())
   project          Project              @relation(fields: [projectId], references: [id])
   projectId        String
+  bankAccount      BankAccount?         @relation(fields: [bankAccountId], references: [id])
+  bankAccountId    String?              // compte spécifique à utiliser — sinon le compte par défaut de l'organisation
   repereNumber     Int                  // "REPÈRE N° 2"
   amountRequested  Decimal
   requestDate      DateTime             @default(now())
@@ -1017,6 +1044,26 @@ model PaymentRequest {
   approvedAt       DateTime?
   approvedById     String?
   createdAt        DateTime             @default(now())
+}
+
+// Une ONG gère souvent plusieurs projets financés par des bailleurs
+// différents, chacun exigeant parfois un compte bancaire dédié — parfois
+// dans des banques différentes. Ce modèle permet d'enregistrer autant de
+// comptes que nécessaire, chacun sélectionnable au moment de créer une
+// demande de paiement.
+model BankAccount {
+  id             String           @id @default(uuid())
+  organization   Organization     @relation(fields: [organizationId], references: [id])
+  organizationId String
+  label          String           // ex. "Compte dédié USAID StopPalu"
+  bankName       String
+  bankAddress    String?
+  accountNumber  String
+  currency       String           @default("GNF")
+  isDefault      Boolean          @default(false)
+  createdAt      DateTime         @default(now())
+
+  paymentRequests PaymentRequest[]
 }
 
 enum PaymentRequestStatus {

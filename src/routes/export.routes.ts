@@ -234,9 +234,21 @@ exportRouter.get("/purchase-orders/:id/pdf", async (req, res) => {
 exportRouter.get("/payment-requests/:id/pdf", async (req, res) => {
   const request = await prisma.paymentRequest.findFirst({
     where: { id: req.params.id, project: { organizationId: req.auth!.organizationId } },
-    include: { project: { include: { organization: true } } },
+    include: { project: { include: { organization: true } }, bankAccount: true },
   });
   if (!request) return res.status(404).json({ error: "Demande de paiement introuvable" });
+
+  // Compte bancaire spécifique à cette demande, sinon compte par défaut de
+  // l'organisation — une ONG à plusieurs bailleurs peut avoir un compte
+  // dédié par projet/subvention, dans des banques différentes.
+  const organizationForPdf = request.bankAccount
+    ? {
+        ...request.project.organization,
+        bankName: request.bankAccount.bankName,
+        bankAddress: request.bankAccount.bankAddress,
+        bankAccountNumber: request.bankAccount.accountNumber,
+      }
+    : request.project.organization;
 
   const buffer = await generatePaymentRequestPdfBuffer({
     repereNumber: request.repereNumber,
@@ -247,7 +259,7 @@ exportRouter.get("/payment-requests/:id/pdf", async (req, res) => {
     preparedByName: request.preparedByName,
     preparedByTitle: request.preparedByTitle,
     project: { name: request.project.name, grantNumber: request.project.grantNumber },
-    organization: request.project.organization,
+    organization: organizationForPdf,
   });
 
   res.setHeader("Content-Type", "application/pdf");

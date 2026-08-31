@@ -19,7 +19,11 @@ import { paymentRequestsRouter, lettersRouter } from "./routes/payment-requests.
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Limite relevée à 2 Mo pour permettre l'envoi du logo de l'organisation en
+// base64 (encodage base64 gonfle la taille réelle d'environ 33%) — le
+// défaut d'Express (100 Ko) était bien trop restrictif et provoquait une
+// erreur 413 sur tout logo, même compressé.
+app.use(express.json({ limit: "2mb" }));
 
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 

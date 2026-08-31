@@ -3,6 +3,7 @@ import { z } from "zod";
 import { prisma } from "../lib/prisma";
 import { requireAuth, requireRole } from "../middleware/auth";
 import { recordPurchaseOrderDelivery, recordSupplierPayment, recordSupplierInvoiceReceived } from "../services/accounting.service";
+import { logAudit } from "../services/audit.service";
 
 export const logisticsRouter = Router();
 logisticsRouter.use(requireAuth);
@@ -74,6 +75,7 @@ logisticsRouter.post("/purchase-orders/:id/validate", requireRole("ADMIN"), asyn
     where: { id: order.id },
     data: { status: "VALIDEE", validatedById: req.auth!.userId, validatedAt: new Date() },
   });
+  await logAudit({ userId: req.auth!.userId, organizationId: req.auth!.organizationId, action: "VALIDATE_ORDER", entity: "PurchaseOrder", entityId: order.id, metadata: { item: order.item, amount: Number(order.amount) } });
   res.json(updated);
 });
 
@@ -94,6 +96,7 @@ logisticsRouter.post("/purchase-orders/:id/reject", requireRole("ADMIN"), async 
     where: { id: order.id },
     data: { status: "REJETEE", validatedById: req.auth!.userId, validatedAt: new Date(), rejectionReason: parsed.data.reason },
   });
+  await logAudit({ userId: req.auth!.userId, organizationId: req.auth!.organizationId, action: "REJECT_ORDER", entity: "PurchaseOrder", entityId: order.id, metadata: { item: order.item, reason: parsed.data.reason } });
   res.json(updated);
 });
 

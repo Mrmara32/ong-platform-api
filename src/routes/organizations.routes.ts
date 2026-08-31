@@ -43,3 +43,49 @@ organizationsRouter.patch("/me", requireRole("ADMIN"), async (req, res) => {
   });
   res.json(updated);
 });
+
+// -------- Comptes bancaires (multi-comptes, multi-banques) --------
+
+organizationsRouter.get("/bank-accounts", async (req, res) => {
+  const accounts = await prisma.bankAccount.findMany({
+    where: { organizationId: req.auth!.organizationId },
+    orderBy: [{ isDefault: "desc" }, { createdAt: "asc" }],
+  });
+  res.json(accounts);
+});
+
+const bankAccountSchema = z.object({
+  label: z.string().min(2),
+  bankName: z.string().min(1),
+  bankAddress: z.string().optional(),
+  accountNumber: z.string().min(1),
+  currency: z.enum(["GNF", "USD", "EUR"]).default("GNF"),
+  isDefault: z.boolean().optional(),
+});
+
+organizationsRouter.post("/bank-accounts", requireRole("ADMIN"), async (req, res) => {
+  const parsed = bankAccountSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  if (parsed.data.isDefault) {
+    await prisma.bankAccount.updateMany({
+      where: { organizationId: req.auth!.organizationId },
+      data: { isDefault: false },
+    });
+  }
+
+  const account = await prisma.bankAccount.create({
+    data: { ...parsed.data, organizationId: req.auth!.organizationId },
+  });
+  res.status(201).json(account);
+});
+
+organizationsRouter.delete("/bank-accounts/:id", requireRole("ADMIN"), async (req, res) => {
+  const account = await prisma.bankAccount.findFirst({
+    where: { id: req.params.id, organizationId: req.auth!.organizationId },
+  });
+  if (!account) return res.status(404).json({ error: "Compte bancaire introuvable" });
+
+  await prisma.bankAccount.delete({ where: { id: account.id } });
+  res.status(204).send();
+});

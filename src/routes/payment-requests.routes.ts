@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma";
 import { requireAuth, requireRole } from "../middleware/auth";
+import { logAudit } from "../services/audit.service";
 
 export const paymentRequestsRouter = Router();
 paymentRequestsRouter.use(requireAuth);
@@ -21,6 +22,7 @@ paymentRequestsRouter.get("/", async (req, res) => {
 
 const createSchema = z.object({
   projectId: z.string().uuid(),
+  bankAccountId: z.string().uuid().optional(),
   repereNumber: z.number().int().positive(),
   amountRequested: z.number().positive(),
   achievements: z.string().min(3),
@@ -67,6 +69,14 @@ paymentRequestsRouter.patch("/:id", requireRole("ADMIN", "COMPTABLE"), async (re
       status: parsed.data.status,
       ...(parsed.data.status === "APPROUVEE_PRESIDENT" ? { approvedById: req.auth!.userId, approvedAt: new Date() } : {}),
     },
+  });
+  await logAudit({
+    userId: req.auth!.userId,
+    organizationId: req.auth!.organizationId,
+    action: `PAYMENT_REQUEST_${parsed.data.status}`,
+    entity: "PaymentRequest",
+    entityId: request.id,
+    metadata: { repereNumber: request.repereNumber, amount: Number(request.amountRequested) },
   });
   res.json(updated);
 });
