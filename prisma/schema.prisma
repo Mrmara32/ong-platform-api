@@ -36,6 +36,7 @@ model Organization {
   projects     Project[]
   staff        Staff[]
   letterTemplates LetterTemplate[]
+  donors          Donor[]
   auditLogs       AuditLog[]
   exchangeRates   ExchangeRate[]
   suppliers    Supplier[]
@@ -119,6 +120,7 @@ enum Role {
   LOGISTICIEN
   RH
   MEMBRE
+  BENEVOLE
   PARTENAIRE_EXTERNE
   BAILLEUR_LECTURE
 }
@@ -156,6 +158,44 @@ enum AccessScope {
 
 // ---------------- Projets & Planification ----------------
 
+// Bailleur de fonds — répertorié une fois au niveau de l'organisation, puis
+// réutilisable pour financer plusieurs projets. Distinct de ProjectPartner
+// (qui lie deux ONG partenaires) : un Donor est spécifiquement une source
+// de financement, avec un montant alloué précis par projet.
+model Donor {
+  id             String       @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  name           String
+  contactName    String?
+  contactEmail   String?
+  contactPhone   String?
+  createdAt      DateTime     @default(now())
+
+  allocations DonorAllocation[]
+}
+
+// Financement précis qu'un bailleur donné apporte à un projet donné — un
+// projet cofinancé par plusieurs bailleurs a une DonorAllocation par
+// bailleur. Chaque ligne budgétaire peut ensuite être rattachée à l'une de
+// ces affectations pour tracer exactement quelles dépenses sont couvertes
+// par quel financement.
+model DonorAllocation {
+  id             String   @id @default(uuid())
+  donor          Donor    @relation(fields: [donorId], references: [id])
+  donorId        String
+  project        Project  @relation(fields: [projectId], references: [id])
+  projectId      String
+  allocatedAmount Decimal
+  currency       String   @default("GNF")
+  grantNumber    String?  // numéro de subvention propre à CE financement, si différent du n° global du projet
+  createdAt      DateTime @default(now())
+
+  budgetLines BudgetLine[]
+
+  @@unique([donorId, projectId])
+}
+
 model Program {
   id             String       @id @default(uuid())
   organization   Organization @relation(fields: [organizationId], references: [id])
@@ -187,6 +227,7 @@ model Project {
   assignments    Assignment[]
   documents      Document[]
   paymentRequests PaymentRequest[]
+  donorAllocations DonorAllocation[]
   sharedWith     ProjectPartner[]
   stockItems     StockItem[]
   vehicleAssignments VehicleProjectAssignment[]
@@ -246,6 +287,23 @@ model Activity {
   budgetLine    BudgetLine? @relation(fields: [budgetLineId], references: [id])
   budgetLineId  String?
   estimatedCost Decimal?
+  updates       ActivityUpdate[]
+}
+
+// Collecte de données terrain : chaque mise à jour remontée depuis le
+// terrain sur une activité (avancement, bénéficiaires touchés, observations)
+// — c'est ce flux qui alimente le tableau de bord d'impact en temps réel,
+// sans attendre un rapport formel de fin de projet.
+model ActivityUpdate {
+  id                  String   @id @default(uuid())
+  activity            Activity @relation(fields: [activityId], references: [id])
+  activityId          String
+  date                DateTime @default(now())
+  note                String
+  beneficiariesReached Int?
+  progressPct         Int?     // avancement de l'activité au moment de cette mise à jour, si renseigné
+  submittedById       String
+  createdAt           DateTime @default(now())
 }
 
 // ---------------- Finances & Comptabilité (SYCEBNL) ----------------
@@ -266,6 +324,13 @@ model BudgetLine {
   maintenances   Maintenance[]
   payments       Payment[]
   assetMaintenances AssetMaintenance[]
+  activities        Activity[]
+  // Affectation précise : cette ligne budgétaire peut être rattachée au
+  // financement d'un bailleur spécifique, pour tracer exactement quelles
+  // dépenses sont couvertes par quel financement — utile dès qu'un projet
+  // est cofinancé par plusieurs bailleurs différents.
+  donorAllocation   DonorAllocation? @relation(fields: [donorAllocationId], references: [id])
+  donorAllocationId String?
   activities        Activity[]
   journalEntries JournalEntry[]
 }
@@ -892,14 +957,19 @@ enum ConsumableRequestStatus {
 }
 
 model Assignment {
-  id        String  @id @default(uuid())
-  staff     Staff   @relation(fields: [staffId], references: [id])
-  staffId   String
-  project   Project @relation(fields: [projectId], references: [id])
-  projectId String
-  allocPct  Int     // taux d'affectation (%)
-  startDate DateTime
-  endDate   DateTime?
+  id          String   @id @default(uuid())
+  staff       Staff    @relation(fields: [staffId], references: [id])
+  staffId     String
+  project     Project  @relation(fields: [projectId], references: [id])
+  projectId   String
+  allocPct    Int      // taux d'affectation (%) — permet le temps partiel et le multi-projets
+  startDate   DateTime
+  endDate     DateTime? // durée déterminée pour un expert/consultant recruté pour X mois — vide si affectation permanente
+  // Un consultant est souvent payé différemment selon le projet/mission —
+  // s'il est renseigné, ce taux remplace le calcul par défaut
+  // (staff.monthlyCost × allocPct/100) pour CETTE affectation précise.
+  monthlyRate Decimal?
+  role        String?  // fonction sur CE projet précis, si différente de son intitulé de poste habituel
 }
 
 // ---------------- Paie ----------------
