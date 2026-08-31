@@ -331,7 +331,6 @@ model BudgetLine {
   // est cofinancé par plusieurs bailleurs différents.
   donorAllocation   DonorAllocation? @relation(fields: [donorAllocationId], references: [id])
   donorAllocationId String?
-  activities        Activity[]
   journalEntries JournalEntry[]
 }
 
