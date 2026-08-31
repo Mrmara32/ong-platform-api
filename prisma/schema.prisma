@@ -998,13 +998,11 @@ model AuditLog {
   metadata  Json?
 }
 
-/**
- * Demande de paiement adressée au bailleur — format calqué sur les
- * documents réels utilisés par le CAM avec USAID (repère numéroté, montant
- * en toutes lettres, justificatifs d'activités, double signature). Distincte
- * de `Invoice` (facturation classique à un client/partenaire) : ce document
- * suit le cycle propre au financement de projet par subvention.
- */
+// Demande de paiement adressée au bailleur — format calqué sur les
+// documents réels utilisés par le CAM avec USAID (repère numéroté, montant
+// en toutes lettres, justificatifs d'activités, double signature). Distincte
+// de `Invoice` (facturation classique à un client/partenaire) : ce document
+// suit le cycle propre au financement de projet par subvention.
 model PaymentRequest {
   id               String               @id @default(uuid())
   project          Project              @relation(fields: [projectId], references: [id])
@@ -1028,12 +1026,10 @@ enum PaymentRequestStatus {
   PAYEE
 }
 
-/**
- * Modèle de lettre réutilisable (bibliothèque). L'organisation part avec un
- * jeu initial de modèles courants et peut en créer/modifier/enregistrer
- * autant qu'elle veut — la bibliothèque grandit avec l'usage plutôt que
- * d'être figée à un nombre arbitraire de modèles pré-écrits.
- */
+// Modèle de lettre réutilisable (bibliothèque). L'organisation part avec un
+// jeu initial de modèles courants et peut en créer/modifier/enregistrer
+// autant qu'elle veut — la bibliothèque grandit avec l'usage plutôt que
+// d'être figée à un nombre arbitraire de modèles pré-écrits.
 model LetterTemplate {
   id             String       @id @default(uuid())
   organization   Organization @relation(fields: [organizationId], references: [id])
@@ -1047,7 +1043,7 @@ model LetterTemplate {
   letters        Letter[]
 }
 
-/** Lettre réellement envoyée, générée à partir d'un modèle et complétée. */
+// Lettre réellement envoyée, générée à partir d'un modèle et complétée.
 model Letter {
   id             String          @id @default(uuid())
   organizationId String
