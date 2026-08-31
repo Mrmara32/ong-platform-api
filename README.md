@@ -16,7 +16,7 @@ npm run seed            # crée une organisation, un utilisateur admin et un pro
 npm run dev              # démarre l'API sur http://localhost:4000
 ```
 
-Identifiants créés par le seed : `admin@sahelops.org` / `motdepasse123`
+Identifiants créés par le seed : `admin@amisdumonde-cam.org` / `motdepasse123`
 
 ## Architecture
 

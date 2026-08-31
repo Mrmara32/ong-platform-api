@@ -1,13 +1,25 @@
-import { Router } from "express";
+import { Router, Request } from "express";
 import PDFDocument from "pdfkit";
 import ExcelJS from "exceljs";
 import { Document as DocxDocument, Packer, Paragraph, HeadingLevel, TextRun } from "docx";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
-import { generatePayslipPdfBuffer } from "../services/pdf.service";
+import { generatePayslipPdfBuffer, generateInvoicePdfBuffer, generatePurchaseOrderPdfBuffer, generatePaymentRequestPdfBuffer, generateLetterPdfBuffer } from "../services/pdf.service";
+import { purchaseOrderNumber } from "../services/invoice-numbering.service";
 
 export const exportRouter = Router();
 exportRouter.use(requireAuth);
+
+/**
+ * Détermine si le PDF doit s'ouvrir dans le navigateur (impression directe,
+ * ?print=1) ou se télécharger comme fichier (comportement par défaut).
+ * Répond à la demande "pouvoir imprimer tout document produit" : le
+ * navigateur ouvre son visualiseur PDF natif, qui propose Ctrl+P directement,
+ * sans étape de téléchargement préalable.
+ */
+function pdfDisposition(req: Request): "inline" | "attachment" {
+  return req.query.print === "1" ? "inline" : "attachment";
+}
 
 // ---------------------------------------------------------------------------
 // Documents (TDR, rapports) — export PDF et Word
@@ -20,7 +32,7 @@ exportRouter.get("/documents/:id/pdf", async (req, res) => {
   if (!doc) return res.status(404).json({ error: "Document introuvable" });
 
   res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="${slug(doc.title)}.pdf"`);
+  res.setHeader("Content-Disposition", `${pdfDisposition(req)}; filename="${slug(doc.title)}.pdf"`);
 
   const pdf = new PDFDocument({ margin: 50 });
   pdf.pipe(res);
@@ -163,7 +175,7 @@ exportRouter.get("/journal/xlsx", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Facture — export PDF
+// Facture — export PDF (téléchargement ou impression directe)
 // ---------------------------------------------------------------------------
 
 exportRouter.get("/invoices/:id/pdf", async (req, res) => {
@@ -173,30 +185,92 @@ exportRouter.get("/invoices/:id/pdf", async (req, res) => {
   });
   if (!invoice) return res.status(404).json({ error: "Facture introuvable" });
 
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="${invoice.number}.pdf"`);
-
-  const pdf = new PDFDocument({ margin: 50 });
-  pdf.pipe(res);
-
-  pdf.fontSize(9).fillColor("#7A8399").text(invoice.organization.name);
-  pdf.moveDown(0.5);
-  pdf.fontSize(20).fillColor("#101B33").text(`Facture ${invoice.number}`);
-  pdf.fontSize(11).fillColor("#3D4761").text(`Client : ${invoice.clientName}`);
-  pdf.text(`Émise le : ${invoice.issueDate.toLocaleDateString("fr-FR")}`);
-  pdf.text(`Échéance : ${invoice.dueDate.toLocaleDateString("fr-FR")}`);
-  pdf.moveDown();
-
-  let total = 0;
-  invoice.lines.forEach((l) => {
-    const lineTotal = Number(l.quantity) * Number(l.unitPrice);
-    total += lineTotal;
-    pdf.text(`${l.description}  —  ${l.quantity} × ${Number(l.unitPrice).toLocaleString("fr-FR")} ${invoice.currency} = ${lineTotal.toLocaleString("fr-FR")} ${invoice.currency}`);
+  const buffer = await generateInvoicePdfBuffer({
+    ...invoice,
+    lines: invoice.lines.map((l) => ({ description: l.description, quantity: Number(l.quantity), unitPrice: Number(l.unitPrice) })),
   });
 
-  pdf.moveDown();
-  pdf.fontSize(13).fillColor("#101B33").text(`Total : ${total.toLocaleString("fr-FR")} ${invoice.currency}`, { align: "right" });
-  pdf.end();
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `${pdfDisposition(req)}; filename="${invoice.number}.pdf"`);
+  res.send(buffer);
+});
+
+// ---------------------------------------------------------------------------
+// Bon de commande — export PDF
+// ---------------------------------------------------------------------------
+
+exportRouter.get("/purchase-orders/:id/pdf", async (req, res) => {
+  const order = await prisma.purchaseOrder.findFirst({
+    where: { id: req.params.id, project: { organizationId: req.auth!.organizationId } },
+    include: { budgetLine: true, supplier: true, validatedBy: { select: { fullName: true } }, project: { include: { organization: true } } },
+  });
+  if (!order) return res.status(404).json({ error: "Commande introuvable" });
+
+  const number = await purchaseOrderNumber(req.auth!.organizationId, order.id);
+  const buffer = await generatePurchaseOrderPdfBuffer({
+    number,
+    item: order.item,
+    amount: Number(order.amount),
+    currency: order.project.currency,
+    createdAt: order.createdAt,
+    status: order.status,
+    validatedAt: order.validatedAt,
+    validatedByName: order.validatedBy?.fullName,
+    deliveryNoteRef: order.deliveryNoteRef,
+    budgetLine: { code: order.budgetLine.code, label: order.budgetLine.label },
+    supplier: { name: order.supplier.name, contact: order.supplier.contact },
+    organization: order.project.organization,
+  });
+
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `${pdfDisposition(req)}; filename="${number}.pdf"`);
+  res.send(buffer);
+});
+
+// ---------------------------------------------------------------------------
+// Demande de paiement — export PDF
+// ---------------------------------------------------------------------------
+
+exportRouter.get("/payment-requests/:id/pdf", async (req, res) => {
+  const request = await prisma.paymentRequest.findFirst({
+    where: { id: req.params.id, project: { organizationId: req.auth!.organizationId } },
+    include: { project: { include: { organization: true } } },
+  });
+  if (!request) return res.status(404).json({ error: "Demande de paiement introuvable" });
+
+  const buffer = await generatePaymentRequestPdfBuffer({
+    repereNumber: request.repereNumber,
+    amountRequested: Number(request.amountRequested),
+    currency: request.project.currency,
+    requestDate: request.requestDate,
+    achievements: request.achievements,
+    preparedByName: request.preparedByName,
+    preparedByTitle: request.preparedByTitle,
+    project: { name: request.project.name, grantNumber: request.project.grantNumber },
+    organization: request.project.organization,
+  });
+
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `${pdfDisposition(req)}; filename="demande-paiement-repere-${request.repereNumber}.pdf"`);
+  res.send(buffer);
+});
+
+// ---------------------------------------------------------------------------
+// Lettre — export PDF
+// ---------------------------------------------------------------------------
+
+exportRouter.get("/letters/:id/pdf", async (req, res) => {
+  const letter = await prisma.letter.findFirst({
+    where: { id: req.params.id, organizationId: req.auth!.organizationId },
+  });
+  if (!letter) return res.status(404).json({ error: "Lettre introuvable" });
+
+  const organization = await prisma.organization.findUniqueOrThrow({ where: { id: req.auth!.organizationId } });
+  const buffer = await generateLetterPdfBuffer({ ...letter, organization });
+
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `${pdfDisposition(req)}; filename="lettre-${letter.reference || letter.id}.pdf"`);
+  res.send(buffer);
 });
 
 // ---------------------------------------------------------------------------
@@ -220,7 +294,7 @@ exportRouter.get("/payslips/:id/pdf", async (req, res) => {
   });
 
   res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="bulletin-${payslip.staff.fullName.replace(/\s+/g, "-")}-${payslip.period}.pdf"`);
+  res.setHeader("Content-Disposition", `${pdfDisposition(req)}; filename="bulletin-${payslip.staff.fullName.replace(/\s+/g, "-")}-${payslip.period}.pdf"`);
   res.send(buffer);
 });
 

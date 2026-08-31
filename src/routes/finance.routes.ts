@@ -1,8 +1,9 @@
 import { Router } from "express";
 import { z } from "zod";
+import crypto from "crypto";
 import { prisma } from "../lib/prisma";
 import { requireAuth, requireRole } from "../middleware/auth";
-import { recordExpense, recordDisbursement, checkBudgetLineAvailability } from "../services/accounting.service";
+import { recordExpense, recordDisbursement, checkBudgetLineAvailability, postManualJournalEntry } from "../services/accounting.service";
 
 export const financeRouter = Router();
 financeRouter.use(requireAuth);
@@ -113,4 +114,107 @@ financeRouter.get("/journal", async (req, res) => {
     take: 200,
   });
   res.json(entries);
+});
+
+// -------- Écriture comptable manuelle (Comptable) --------
+
+const manualEntrySchema = z.object({
+  label: z.string().min(2),
+  date: z.string().optional(),
+  projectId: z.string().uuid().optional(),
+  budgetLineId: z.string().uuid().optional(),
+  lines: z
+    .array(
+      z.object({
+        accountCode: z.string().min(1),
+        accountLabel: z.string().min(1),
+        debit: z.number().nonnegative().optional(),
+        credit: z.number().nonnegative().optional(),
+      })
+    )
+    .min(2),
+});
+
+/**
+ * Saisie libre d'une écriture comptable en partie double — pour tout ce que
+ * les flux automatiques (dépense, décaissement, livraison, paie...) ne
+ * couvrent pas : régularisations, amortissements, écritures d'inventaire...
+ */
+financeRouter.post("/journal/manual", requireRole("ADMIN", "COMPTABLE"), async (req, res) => {
+  const parsed = manualEntrySchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  try {
+    const entries = await postManualJournalEntry({
+      organizationId: req.auth!.organizationId,
+      projectId: parsed.data.projectId,
+      budgetLineId: parsed.data.budgetLineId,
+      label: parsed.data.label,
+      date: parsed.data.date ? new Date(parsed.data.date) : undefined,
+      createdById: req.auth!.userId,
+      lines: parsed.data.lines,
+    });
+    res.status(201).json(entries);
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : "Écriture invalide" });
+  }
+});
+
+// -------- Rapprochement bancaire --------
+
+financeRouter.get("/bank-statement-lines", async (req, res) => {
+  const lines = await prisma.bankStatementLine.findMany({
+    where: { organizationId: req.auth!.organizationId },
+    include: { matched: true },
+    orderBy: { date: "desc" },
+  });
+  res.json(lines);
+});
+
+const bankLineSchema = z.object({
+  date: z.string(),
+  label: z.string().min(1),
+  amount: z.number(),
+  reference: z.string().optional(),
+});
+
+financeRouter.post("/bank-statement-lines", requireRole("ADMIN", "COMPTABLE"), async (req, res) => {
+  const parsed = bankLineSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const line = await prisma.bankStatementLine.create({
+    data: { ...parsed.data, date: new Date(parsed.data.date), organizationId: req.auth!.organizationId },
+  });
+  res.status(201).json(line);
+});
+
+/** Écritures de trésorerie (classe 5) non encore rapprochées — candidates au pointage. */
+financeRouter.get("/journal/unreconciled", requireRole("ADMIN", "COMPTABLE"), async (req, res) => {
+  const entries = await prisma.journalEntry.findMany({
+    where: {
+      account: { organizationId: req.auth!.organizationId, classNumber: 5 },
+      reconciled: false,
+    },
+    include: { account: true },
+    orderBy: { date: "desc" },
+  });
+  res.json(entries);
+});
+
+const matchSchema = z.object({ journalEntryId: z.string().uuid() });
+
+/** Rapproche une ligne de relevé bancaire avec une écriture de trésorerie. */
+financeRouter.post("/bank-statement-lines/:id/match", requireRole("ADMIN", "COMPTABLE"), async (req, res) => {
+  const parsed = matchSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const line = await prisma.bankStatementLine.findFirst({
+    where: { id: req.params.id, organizationId: req.auth!.organizationId },
+  });
+  if (!line) return res.status(404).json({ error: "Ligne de relevé introuvable" });
+
+  const entry = await prisma.journalEntry.update({
+    where: { id: parsed.data.journalEntryId },
+    data: { bankStatementLineId: line.id, reconciled: true, reconciledAt: new Date() },
+  });
+  res.json(entry);
 });

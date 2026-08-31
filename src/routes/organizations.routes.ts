@@ -19,6 +19,16 @@ const updateSchema = z.object({
   name: z.string().min(2).optional(),
   type: z.enum(["ONG", "BAILLEUR", "PRESTATAIRE", "AUTRE"]).optional(),
   country: z.string().min(2).optional(),
+  address: z.string().optional(),
+  registrationNumber: z.string().optional(),
+  taxId: z.string().optional(),
+  phone: z.string().optional(),
+  email: z.string().email().optional().or(z.literal("")),
+  website: z.string().optional(),
+  bankName: z.string().optional(),
+  bankAddress: z.string().optional(),
+  bankAccountNumber: z.string().optional(),
+  logoUrl: z.string().optional(), // URL hébergée ou data URL base64 (logo léger, pas d'upload de fichier volumineux)
 });
 
 /** Met à jour les informations de l'organisation — réservé à l'Admin/Président. */

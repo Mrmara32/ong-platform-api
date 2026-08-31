@@ -15,15 +15,26 @@ generator client {
 // ---------------- Multi-tenant / Comptes ----------------
 
 model Organization {
-  id        String   @id @default(uuid())
-  name      String
-  type      String   // "ONG", "Bailleur", "Prestataire", ...
-  country   String?
-  createdAt DateTime @default(now())
+  id                 String   @id @default(uuid())
+  name               String
+  type               String   // "ONG", "Bailleur", "Prestataire", ...
+  country            String?
+  address            String?  // adresse complète (siège), imprimée sur les documents officiels
+  registrationNumber String?  // N° d'agrément / récépissé
+  taxId              String?  // NIF / numéro d'identification fiscale, si applicable
+  phone              String?
+  email              String?
+  website            String?
+  bankName           String?  // ex. BICIGUI — imprimé sur les demandes de paiement aux bailleurs
+  bankAddress        String?
+  bankAccountNumber  String?
+  logoUrl            String?  // logo (data URL base64 ou lien hébergé) imprimé sur bulletins, factures, TDR...
+  createdAt          DateTime @default(now())
 
   users        Membership[]
   projects     Project[]
   staff        Staff[]
+  letterTemplates LetterTemplate[]
   suppliers    Supplier[]
   accounts     ChartOfAccount[]
   documents    Document[]
@@ -35,6 +46,8 @@ model Organization {
   assets       Asset[]
   notifications Notification[]
   invitations  Invitation[]
+  bankStatementLines BankStatementLine[]
+  consumableRequests ConsumableRequest[]
   programs           Program[]
   partneredProjects  ProjectPartner[]
   sharedResources    SharedResource[]
@@ -53,6 +66,8 @@ model User {
   createdExpenses    Expense[]
   authoredDocuments  Document[]
   invitationsSent    Invitation[]
+  validatedOrders    PurchaseOrder[]
+  registeredSupplierInvoices SupplierInvoice[]
 }
 
 // Un utilisateur peut appartenir à plusieurs organisations avec des rôles différents
@@ -155,7 +170,8 @@ model Project {
   name           String
   code           String       @unique
   donor          String
-  currency       String       @default("XOF")
+  grantNumber    String?      // N° de subvention attribué par le bailleur (ex. 0213947-G-2017-002-00)
+  currency       String       @default("GNF")
   totalBudget    Decimal
   startDate      DateTime
   endDate        DateTime
@@ -167,6 +183,7 @@ model Project {
   purchaseOrders PurchaseOrder[]
   assignments    Assignment[]
   documents      Document[]
+  paymentRequests PaymentRequest[]
   sharedWith     ProjectPartner[]
   stockItems     StockItem[]
   vehicleAssignments VehicleProjectAssignment[]
@@ -210,16 +227,22 @@ model LogframeResult {
 }
 
 model Activity {
-  id          String    @id @default(uuid())
-  project     Project   @relation(fields: [projectId], references: [id])
-  projectId   String
-  title       String
-  startDate   DateTime
-  endDate     DateTime
-  progressPct Int       @default(0)
-  status      String    @default("À faire")
-  owner       User?     @relation(fields: [ownerId], references: [id]) // utilisateur responsable — sert de filtre pour l'espace personnel
-  ownerId     String?
+  id            String      @id @default(uuid())
+  project       Project     @relation(fields: [projectId], references: [id])
+  projectId     String
+  title         String
+  startDate     DateTime
+  endDate       DateTime
+  progressPct   Int         @default(0)
+  status        String      @default("À faire")
+  owner         User?       @relation(fields: [ownerId], references: [id]) // utilisateur responsable — sert de filtre pour l'espace personnel
+  ownerId       String?
+  // Planification budgétaire : toute activité planifiée avec un coût doit
+  // être rattachée à une ligne budgétaire précise du projet — le coût ne
+  // peut pas dépasser silencieusement le disponible de cette ligne.
+  budgetLine    BudgetLine? @relation(fields: [budgetLineId], references: [id])
+  budgetLineId  String?
+  estimatedCost Decimal?
 }
 
 // ---------------- Finances & Comptabilité (SYCEBNL) ----------------
@@ -240,6 +263,7 @@ model BudgetLine {
   maintenances   Maintenance[]
   payments       Payment[]
   assetMaintenances AssetMaintenance[]
+  activities        Activity[]
   journalEntries JournalEntry[]
 }
 
@@ -272,6 +296,14 @@ model JournalEntry {
   sourceType  JournalSource   // origine de l'écriture
   sourceId    String?         // id de la dépense / décaissement / livraison liée
   syncStatus  SyncStatus      @default(SYNCED) // gestion du mode hors-ligne
+  entryGroup  String?         // regroupe les lignes d'une même écriture manuelle en partie double
+  createdById String?         // utilisateur ayant saisi l'écriture (MANUEL) — traçabilité
+  // Rapprochement bancaire : une écriture de trésorerie (classe 5) est
+  // rapprochée une fois retrouvée sur le relevé bancaire correspondant.
+  reconciled     Boolean            @default(false)
+  reconciledAt   DateTime?
+  bankStatementLine   BankStatementLine? @relation(fields: [bankStatementLineId], references: [id])
+  bankStatementLineId String?            @unique
 }
 
 enum JournalSource {
@@ -279,6 +311,21 @@ enum JournalSource {
   DECAISSEMENT
   LIVRAISON
   MANUEL
+}
+
+// Ligne de relevé bancaire saisie (manuellement ou importée) pour le
+// rapprochement : chaque ligne est éventuellement mise en correspondance
+// avec UNE écriture de trésorerie (JournalEntry.bankStatementLineId).
+model BankStatementLine {
+  id             String        @id @default(uuid())
+  organizationId String
+  organization   Organization  @relation(fields: [organizationId], references: [id])
+  date           DateTime
+  label          String
+  amount         Decimal       // positif = crédit banque (entrée), négatif = débit banque (sortie)
+  reference      String?
+  matched        JournalEntry?
+  createdAt      DateTime      @default(now())
 }
 
 enum SyncStatus {
@@ -331,24 +378,58 @@ model Supplier {
 }
 
 model PurchaseOrder {
-  id           String       @id @default(uuid())
-  project      Project      @relation(fields: [projectId], references: [id])
-  projectId    String
-  budgetLine   BudgetLine   @relation(fields: [budgetLineId], references: [id])
-  budgetLineId String
-  supplier     Supplier     @relation(fields: [supplierId], references: [id])
-  supplierId   String
-  item         String
-  amount       Decimal
-  status       OrderStatus  @default(COMMANDE)
-  createdAt    DateTime     @default(now())
-  deliveredAt  DateTime?
+  id                String       @id @default(uuid())
+  project           Project      @relation(fields: [projectId], references: [id])
+  projectId         String
+  budgetLine        BudgetLine   @relation(fields: [budgetLineId], references: [id])
+  budgetLineId      String
+  supplier          Supplier     @relation(fields: [supplierId], references: [id])
+  supplierId        String
+  item              String
+  amount            Decimal
+  status            OrderStatus  @default(EN_ATTENTE_VALIDATION)
+  createdAt         DateTime     @default(now())
+  // Validation par le Président/Admin — obligatoire avant toute livraison
+  validatedById     String?
+  validatedBy       User?        @relation(fields: [validatedById], references: [id])
+  validatedAt       DateTime?
+  rejectionReason   String?      // motif si le Président refuse la commande
+  // Réception de la livraison (bon de livraison physique reçu du fournisseur)
+  deliveredAt       DateTime?
+  deliveryNoteRef   String?      // référence du bon de livraison papier reçu
+  // Facture fournisseur — reçue par le Comptable, condition du paiement
+  supplierInvoice   SupplierInvoice?
 }
 
 enum OrderStatus {
-  COMMANDE
-  LIVRE
-  COMPTABILISE
+  EN_ATTENTE_VALIDATION // passée par la Logistique, en attente du Président
+  REJETEE               // refusée par le Président (voir rejectionReason)
+  VALIDEE               // validée par le Président — la commande peut être envoyée au fournisseur
+  LIVREE                // bon de livraison + marchandise reçus
+  FACTURE_RECUE         // facture fournisseur enregistrée par le Comptable, prête pour paiement
+  COMPTABILISEE         // payée et comptabilisée
+}
+
+// Facture fournisseur reçue en contrepartie d'une commande livrée — distincte
+// de `Invoice` (les factures que l'ONG ÉMET). Le Comptable ne peut déclencher
+// le paiement qu'une fois cette facture enregistrée, conformément au cycle :
+// Logistique commande → Président valide → Livraison (BL) → Facture reçue
+// (Comptable) → Paiement.
+model SupplierInvoice {
+  id              String        @id @default(uuid())
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
+  purchaseOrderId String        @unique
+  invoiceNumber   String        // numéro de facture du fournisseur (pas le nôtre)
+  amount          Decimal
+  receivedAt      DateTime      @default(now())
+  registeredById  String?
+  registeredBy    User?         @relation(fields: [registeredById], references: [id])
+  status          SupplierInvoiceStatus @default(RECUE)
+}
+
+enum SupplierInvoiceStatus {
+  RECUE
+  PAYEE
 }
 
 // ---------------- Facturation ----------------
@@ -361,7 +442,7 @@ model Invoice {
   projectId      String?
   number         String        // numérotation séquentielle, unique par organisation
   clientName     String        // partenaire/client facturé pour la prestation
-  currency       String        @default("XOF")
+  currency       String        @default("GNF")
   issueDate      DateTime      @default(now())
   dueDate        DateTime
   status         InvoiceStatus @default(EMISE)
@@ -717,11 +798,94 @@ model Staff {
   monthlyCost    Decimal
   email          String?
   phone          String?      // utilisé pour le partage du bulletin de paie via WhatsApp
+  address        String?      // adresse personnelle, imprimée sur le bulletin de paie
+  nationalId     String?      // n° de carte d'identité / passeport
+  hireDate       DateTime?    // date d'embauche
+  endDate        DateTime?    // date de fin de contrat, le cas échéant
+  contractType   ContractType @default(CDI)
+  category       String?      // catégorie professionnelle / classification (utile pour la paie)
+  cnssNumber     String?      // n° d'immatriculation sécurité sociale (CNSS ou équivalent national)
+  status         StaffStatus  @default(ACTIF)
 
   assignments Assignment[]
   payments    Payment[]
   payslips    Payslip[]
   driverProfile Driver?
+  leaveRequests LeaveRequest[]
+  consumableRequests ConsumableRequest[]
+}
+
+enum ContractType {
+  CDI
+  CDD
+  PRESTATION
+  STAGE
+  BENEVOLE
+}
+
+enum StaffStatus {
+  ACTIF
+  SUSPENDU
+  SORTI // fin de contrat / démission / licenciement
+}
+
+// Demande de congé d'un employé — véritable outil RH au-delà de la simple fiche de paie.
+model LeaveRequest {
+  id          String            @id @default(uuid())
+  staff       Staff             @relation(fields: [staffId], references: [id])
+  staffId     String
+  type        LeaveType
+  startDate   DateTime
+  endDate     DateTime
+  reason      String?
+  status      LeaveRequestStatus @default(EN_ATTENTE)
+  decidedById String?
+  decidedAt   DateTime?
+  createdAt   DateTime          @default(now())
+}
+
+enum LeaveType {
+  CONGE_ANNUEL
+  MALADIE
+  MATERNITE_PATERNITE
+  SANS_SOLDE
+  AUTRE
+}
+
+enum LeaveRequestStatus {
+  EN_ATTENTE
+  APPROUVEE
+  REFUSEE
+}
+
+// Demande de consommables/fournitures par un employé — point d'entrée du
+// cycle logistique côté "besoin terrain" : une fois approuvée, elle peut
+// être servie depuis le stock existant (sortie) ou déclencher une commande
+// fournisseur si le stock est insuffisant.
+model ConsumableRequest {
+  id             String                 @id @default(uuid())
+  organizationId String
+  organization   Organization           @relation(fields: [organizationId], references: [id])
+  requestedBy    Staff                  @relation(fields: [staffId], references: [id])
+  staffId        String
+  projectId      String?
+  itemName       String
+  quantity       Decimal
+  unit           String
+  justification  String?
+  status         ConsumableRequestStatus @default(EN_ATTENTE)
+  approvedById   String?
+  approvedAt     DateTime?
+  fulfilledFromStockItemId String?       // si servi depuis un article de stock existant
+  createdAt      DateTime               @default(now())
+}
+
+enum ConsumableRequestStatus {
+  EN_ATTENTE
+  APPROUVEE
+  REFUSEE
+  SERVIE_STOCK      // servie directement depuis le stock disponible
+  COMMANDE_REQUISE  // stock insuffisant, une commande fournisseur est nécessaire
 }
 
 model Assignment {
@@ -743,16 +907,34 @@ model Payslip {
   staffId      String
   period       String    // format "YYYY-MM"
   baseSalary   Decimal
-  bonuses      Decimal   @default(0)
-  deductions   Decimal   @default(0)
+  bonuses      Decimal   @default(0)   // total des primes (dérivé des lignes PayslipLine BONUS)
+  deductions   Decimal   @default(0)   // total des retenues (dérivé des lignes PayslipLine DEDUCTION)
   netPay       Decimal   // baseSalary + bonuses - deductions
   status       PayslipStatus @default(GENERE)
   generatedAt  DateTime  @default(now())
   sharedVia    String[]  @default([]) // ex. ["email", "whatsapp"]
 
+  lines    PayslipLine[]
   payments Payment[]
 
   @@unique([staffId, period])
+}
+
+// Ligne détaillée d'un bulletin de paie (prime ou retenue nommée), pour un
+// document professionnel et transparent plutôt qu'un simple total global.
+// Ex. : "Prime de transport" (BONUS), "Cotisation CNSS" (DEDUCTION).
+model PayslipLine {
+  id        String          @id @default(uuid())
+  payslip   Payslip         @relation(fields: [payslipId], references: [id])
+  payslipId String
+  label     String
+  type      PayslipLineType
+  amount    Decimal
+}
+
+enum PayslipLineType {
+  PRIME
+  RETENUE
 }
 
 enum PayslipStatus {
@@ -814,4 +996,69 @@ model AuditLog {
   entityId  String
   timestamp DateTime @default(now())
   metadata  Json?
+}
+
+/**
+ * Demande de paiement adressée au bailleur — format calqué sur les
+ * documents réels utilisés par le CAM avec USAID (repère numéroté, montant
+ * en toutes lettres, justificatifs d'activités, double signature). Distincte
+ * de `Invoice` (facturation classique à un client/partenaire) : ce document
+ * suit le cycle propre au financement de projet par subvention.
+ */
+model PaymentRequest {
+  id               String               @id @default(uuid())
+  project          Project              @relation(fields: [projectId], references: [id])
+  projectId        String
+  repereNumber     Int                  // "REPÈRE N° 2"
+  amountRequested  Decimal
+  requestDate      DateTime             @default(now())
+  achievements     String               // justificatifs (une ligne par réalisation, séparées par \n)
+  preparedByName   String
+  preparedByTitle  String
+  status           PaymentRequestStatus @default(BROUILLON)
+  approvedAt       DateTime?
+  approvedById     String?
+  createdAt        DateTime             @default(now())
+}
+
+enum PaymentRequestStatus {
+  BROUILLON
+  APPROUVEE_PRESIDENT
+  ENVOYEE_BAILLEUR
+  PAYEE
+}
+
+/**
+ * Modèle de lettre réutilisable (bibliothèque). L'organisation part avec un
+ * jeu initial de modèles courants et peut en créer/modifier/enregistrer
+ * autant qu'elle veut — la bibliothèque grandit avec l'usage plutôt que
+ * d'être figée à un nombre arbitraire de modèles pré-écrits.
+ */
+model LetterTemplate {
+  id             String       @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  title          String       // ex. "Lettre de transmission de rapport"
+  category       String       // ex. "Bailleur", "Fournisseur", "RH", "Partenaire"
+  bodySample     String       // corps type avec balises {{destinataire}}, {{objet}}, {{corps}}...
+  isSystem       Boolean      @default(false) // modèle fourni par défaut (non supprimable)
+  createdAt      DateTime     @default(now())
+
+  letters        Letter[]
+}
+
+/** Lettre réellement envoyée, générée à partir d'un modèle et complétée. */
+model Letter {
+  id             String          @id @default(uuid())
+  organizationId String
+  template       LetterTemplate? @relation(fields: [templateId], references: [id])
+  templateId     String?
+  reference      String?         // ex. "N° 014/CAM/BK/2026"
+  recipientTitle String          // ex. "Monsieur le Conseiller Régional du Projet STOPPALU de Boké"
+  subject        String
+  body           String
+  signatoryName  String
+  signatoryTitle String
+  projectId      String?
+  createdAt      DateTime        @default(now())
 }

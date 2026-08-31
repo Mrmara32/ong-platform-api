@@ -33,7 +33,8 @@ const createProjectSchema = z.object({
   name: z.string().min(2),
   code: z.string().min(2),
   donor: z.string(),
-  currency: z.string().default("XOF"),
+  grantNumber: z.string().optional(),
+  currency: z.enum(["GNF", "USD", "EUR"]).default("GNF"),
   totalBudget: z.number().positive(),
   startDate: z.string(),
   endDate: z.string(),
@@ -53,6 +54,7 @@ projectsRouter.post("/", requireRole("ADMIN", "CHEF_PROJET"), async (req, res) =
       name: data.name,
       code: data.code,
       donor: data.donor,
+      grantNumber: data.grantNumber,
       currency: data.currency,
       totalBudget: data.totalBudget,
       startDate: new Date(data.startDate),
@@ -99,7 +101,7 @@ projectsRouter.get("/:id/activities", async (req, res) => {
       projectId: project.id,
       ...personalScopeFilter(access, req.auth!.userId, "ownerId"),
     },
-    include: { owner: { select: { id: true, fullName: true } } },
+    include: { owner: { select: { id: true, fullName: true } }, budgetLine: { select: { code: true, label: true } } },
     orderBy: { startDate: "asc" },
   });
 
@@ -111,8 +113,17 @@ const activitySchema = z.object({
   startDate: z.string(),
   endDate: z.string(),
   ownerId: z.string().uuid().optional(), // par défaut, l'activité est assignée à son créateur
+  budgetLineId: z.string().uuid().optional(), // ligne budgétaire du projet portant le coût de l'activité
+  estimatedCost: z.number().nonnegative().optional(),
 });
 
+/**
+ * Planifie une activité, avec son coût le cas échéant rattaché à une ligne
+ * budgétaire précise du projet — conformément à l'exigence de planification
+ * chiffrée en cohérence avec le budget disponible. Si un coût dépasse le
+ * disponible de la ligne, la création reste possible (dérogation métier) mais
+ * l'API renvoie `exceedsBudgetLine: true` pour que l'interface puisse alerter.
+ */
 projectsRouter.post("/:id/activities", async (req, res) => {
   const parsed = activitySchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
@@ -125,6 +136,19 @@ projectsRouter.post("/:id/activities", async (req, res) => {
   const access = await resolveProjectAccess(req.auth!, project.id);
   if (!access.canAccess) return res.status(403).json({ error: "Aucun accès à ce projet" });
 
+  let exceedsBudgetLine = false;
+  if (parsed.data.budgetLineId && parsed.data.estimatedCost) {
+    const line = await prisma.budgetLine.findUnique({ where: { id: parsed.data.budgetLineId } });
+    if (line) {
+      const alreadyPlanned = await prisma.activity.aggregate({
+        where: { budgetLineId: parsed.data.budgetLineId },
+        _sum: { estimatedCost: true },
+      });
+      const committed = Number(alreadyPlanned._sum.estimatedCost ?? 0) + Number(line.spent);
+      exceedsBudgetLine = committed + parsed.data.estimatedCost > Number(line.allocated);
+    }
+  }
+
   const activity = await prisma.activity.create({
     data: {
       projectId: project.id,
@@ -132,10 +156,12 @@ projectsRouter.post("/:id/activities", async (req, res) => {
       startDate: new Date(parsed.data.startDate),
       endDate: new Date(parsed.data.endDate),
       ownerId: parsed.data.ownerId ?? req.auth!.userId,
+      budgetLineId: parsed.data.budgetLineId,
+      estimatedCost: parsed.data.estimatedCost,
     },
   });
 
-  res.status(201).json(activity);
+  res.status(201).json({ ...activity, exceedsBudgetLine });
 });
 
 /**

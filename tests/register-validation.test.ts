@@ -16,11 +16,11 @@ const registerSchema = z.object({
 });
 
 const validPayload = {
-  organizationName: "ONG Sahel Ops",
+  organizationName: "ONG Club des Amis du Monde (CAM)",
   organizationType: "ONG" as const,
-  country: "Niger",
+  country: "Guinée",
   fullName: "Aïcha Ndiaye",
-  email: "admin@sahelops.org",
+  email: "admin@amisdumonde-cam.org",
   password: "motdepasse123",
 };
 

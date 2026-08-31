@@ -39,7 +39,7 @@ npm run dev          # démarre l'API sur http://localhost:4000
 
 Puis, pour un test de bout en bout manuel minimal :
 
-1. `POST /api/auth/login` avec `admin@sahelops.org` / `motdepasse123` → récupérer le token
+1. `POST /api/auth/login` avec `admin@amisdumonde-cam.org` / `motdepasse123` → récupérer le token
 2. `GET /api/projects` → noter l'id du projet créé par le seed
 3. `GET /api/finance/projects/:id/budget-lines` → noter l'id d'une ligne
 4. `POST /api/finance/expenses` avec cette ligne → vérifier que `spent` augmente et qu'une écriture apparaît dans `GET /api/finance/journal`

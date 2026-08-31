@@ -1,5 +1,6 @@
+import crypto from "crypto";
 import { prisma } from "../lib/prisma";
-import { JournalSource, SyncStatus } from "@prisma/client";
+import { JournalSource, SyncStatus, PaymentMethod } from "@prisma/client";
 
 /**
  * Ce service centralise TOUTE écriture comptable générée automatiquement par
@@ -182,16 +183,45 @@ export async function recordDisbursement(input: {
 }
 
 /** Déclenché lors de la confirmation de livraison d'une commande (module Logistique). */
-export async function recordPurchaseOrderDelivery(purchaseOrderId: string, organizationId: string) {
+/**
+ * Confirme la RÉCEPTION PHYSIQUE d'une commande validée (bon de livraison +
+ * marchandise reçus). Purement opérationnel — aucune écriture comptable ici :
+ * la dette envers le fournisseur n'est légalement constatée qu'à réception
+ * de sa facture (voir recordSupplierInvoiceReceived), conformément au cycle
+ * Commande → Validation Président → Livraison → Facture reçue → Paiement.
+ */
+export async function recordPurchaseOrderDelivery(purchaseOrderId: string, deliveryNoteRef?: string) {
+  return prisma.purchaseOrder.update({
+    where: { id: purchaseOrderId },
+    data: { status: "LIVREE", deliveredAt: new Date(), deliveryNoteRef },
+  });
+}
+
+/**
+ * Enregistre la facture fournisseur reçue pour une commande livrée — c'est
+ * CE moment, et lui seul, qui comptabilise la dette (débit charge / crédit
+ * compte fournisseur 401) et impute la dépense sur la ligne budgétaire.
+ * Rôle réservé au Comptable (cf. cahier des charges) : c'est lui qui reçoit
+ * matériellement la facture papier et la rapproche de la commande.
+ */
+export async function recordSupplierInvoiceReceived(input: {
+  organizationId: string;
+  purchaseOrderId: string;
+  invoiceNumber: string;
+  amount: number;
+  registeredById?: string;
+}) {
+  const { organizationId, purchaseOrderId, invoiceNumber, amount, registeredById } = input;
   const order = await prisma.purchaseOrder.findUniqueOrThrow({
     where: { id: purchaseOrderId },
     include: { budgetLine: true, supplier: true },
   });
 
-  const updated = await prisma.purchaseOrder.update({
-    where: { id: purchaseOrderId },
-    data: { status: "COMPTABILISE", deliveredAt: new Date() },
+  const supplierInvoice = await prisma.supplierInvoice.create({
+    data: { purchaseOrderId, invoiceNumber, amount, registeredById },
   });
+
+  await prisma.purchaseOrder.update({ where: { id: purchaseOrderId }, data: { status: "FACTURE_RECUE" } });
 
   await postJournalEntry({
     organizationId,
@@ -202,15 +232,15 @@ export async function recordPurchaseOrderDelivery(purchaseOrderId: string, organ
     counterpartAccountCode: "401",
     counterpartAccountLabel: `Fournisseur — ${order.supplier.name}`,
     counterpartClassNumber: 4,
-    amount: Number(order.amount),
-    label: `Livraison — ${order.item}`,
+    amount,
+    label: `Facture fournisseur ${invoiceNumber} — ${order.item}`,
     sourceType: "LIVRAISON",
     sourceId: order.id,
   });
 
-  await increaseBudgetLineSpent(order.budgetLineId, Number(order.amount));
+  await increaseBudgetLineSpent(order.budgetLineId, amount);
 
-  return updated;
+  return supplierInvoice;
 }
 
 /** Déclenché à l'enregistrement d'un plein de carburant (module Logistique). */
@@ -279,7 +309,7 @@ export async function recordMaintenanceExpense(input: {
 // Le compte de trésorerie SYCEBNL varie selon le canal utilisé : la banque (521)
 // pour les virements, un sous-compte dédié par opérateur de mobile money pour
 // les autres, ce qui permet le rapprochement propre à chaque canal.
-const TREASURY_ACCOUNT_BY_METHOD: Record<string, { code: string; label: string }> = {
+const TREASURY_ACCOUNT_BY_METHOD: Record<PaymentMethod, { code: string; label: string }> = {
   VIREMENT: { code: "521", label: "Banque" },
   ORANGE_MONEY: { code: "5711", label: "Mobile money — Orange Money" },
   MTN_MONEY: { code: "5712", label: "Mobile money — MTN Money" },
@@ -301,10 +331,11 @@ export async function recordSupplierPayment(input: {
   budgetLineId?: string;
   supplierId: string;
   amount: number;
-  method: keyof typeof TREASURY_ACCOUNT_BY_METHOD;
+  method: PaymentMethod;
   reference?: string;
+  purchaseOrderId?: string; // si fourni, clôture le cycle : facture fournisseur -> payée, commande -> comptabilisée
 }) {
-  const { organizationId, projectId, budgetLineId, supplierId, amount, method, reference } = input;
+  const { organizationId, projectId, budgetLineId, supplierId, amount, method, reference, purchaseOrderId } = input;
   const treasury = TREASURY_ACCOUNT_BY_METHOD[method];
 
   const payment = await prisma.payment.create({
@@ -337,6 +368,11 @@ export async function recordSupplierPayment(input: {
     sourceId: payment.id,
   });
 
+  if (purchaseOrderId) {
+    await prisma.supplierInvoice.updateMany({ where: { purchaseOrderId }, data: { status: "PAYEE" } });
+    await prisma.purchaseOrder.update({ where: { id: purchaseOrderId }, data: { status: "COMPTABILISEE" } });
+  }
+
   return payment;
 }
 
@@ -345,7 +381,7 @@ export async function recordInvoicePayment(input: {
   organizationId: string;
   invoiceId: string;
   amount: number;
-  method: keyof typeof TREASURY_ACCOUNT_BY_METHOD;
+  method: PaymentMethod;
   reference?: string;
 }) {
   const { organizationId, invoiceId, amount, method, reference } = input;
@@ -397,7 +433,7 @@ export async function recordPayslipPayment(input: {
   payslipId: string;
   staffId: string;
   amount: number;
-  method: keyof typeof TREASURY_ACCOUNT_BY_METHOD;
+  method: PaymentMethod;
   reference?: string;
 }) {
   const { organizationId, projectId, budgetLineId, payslipId, staffId, amount, method, reference } = input;
@@ -479,4 +515,89 @@ export async function recordAssetMaintenanceExpense(input: {
   });
 
   await increaseBudgetLineSpent(budgetLineId, amount);
+}
+
+// ---------------------------------------------------------------------------
+// Écriture comptable manuelle (saisie libre par le Comptable)
+// ---------------------------------------------------------------------------
+
+export interface ManualEntryLine {
+  accountCode: string;
+  accountLabel: string;
+  debit?: number;
+  credit?: number;
+}
+
+/**
+ * Vérifie qu'une écriture manuelle respecte la partie double : au moins deux
+ * lignes, chaque ligne mouvementée d'un seul côté (débit OU crédit, jamais
+ * les deux), et total débit = total crédit. Fonction pure, testée isolément
+ * — c'est la seule garde-fou avant d'écrire quoi que ce soit en base.
+ */
+export function validateDoubleEntry(lines: ManualEntryLine[]): { valid: boolean; error?: string; totalDebit: number; totalCredit: number } {
+  if (lines.length < 2) {
+    return { valid: false, error: "Une écriture doit comporter au moins deux lignes", totalDebit: 0, totalCredit: 0 };
+  }
+  for (const line of lines) {
+    const debit = line.debit ?? 0;
+    const credit = line.credit ?? 0;
+    if (debit > 0 && credit > 0) {
+      return { valid: false, error: `La ligne "${line.accountLabel}" ne peut pas être à la fois débitée et créditée`, totalDebit: 0, totalCredit: 0 };
+    }
+    if (debit === 0 && credit === 0) {
+      return { valid: false, error: `La ligne "${line.accountLabel}" doit avoir un montant au débit ou au crédit`, totalDebit: 0, totalCredit: 0 };
+    }
+  }
+  const totalDebit = lines.reduce((s, l) => s + (l.debit ?? 0), 0);
+  const totalCredit = lines.reduce((s, l) => s + (l.credit ?? 0), 0);
+  if (Math.abs(totalDebit - totalCredit) > 0.01) {
+    return { valid: false, error: `Écriture déséquilibrée : débit ${totalDebit} ≠ crédit ${totalCredit}`, totalDebit, totalCredit };
+  }
+  return { valid: true, totalDebit, totalCredit };
+}
+
+/** Poste une écriture manuelle validée (partie double) — réservé au Comptable. */
+export async function postManualJournalEntry(input: {
+  organizationId: string;
+  projectId?: string;
+  budgetLineId?: string;
+  label: string;
+  date?: Date;
+  createdById: string;
+  lines: ManualEntryLine[];
+}) {
+  const validation = validateDoubleEntry(input.lines);
+  if (!validation.valid) throw new Error(validation.error);
+
+  const entryGroup = crypto.randomUUID();
+  const results = [];
+  for (const line of input.lines) {
+    const account = await prisma.chartOfAccount.upsert({
+      where: { organizationId_accountCode: { organizationId: input.organizationId, accountCode: line.accountCode } },
+      update: {},
+      create: {
+        organizationId: input.organizationId,
+        accountCode: line.accountCode,
+        label: line.accountLabel,
+        classNumber: parseInt(line.accountCode[0], 10),
+      },
+    });
+    results.push(
+      await prisma.journalEntry.create({
+        data: {
+          accountId: account.id,
+          projectId: input.projectId,
+          budgetLineId: input.budgetLineId,
+          date: input.date ?? new Date(),
+          debit: line.debit ?? 0,
+          credit: line.credit ?? 0,
+          label: input.label,
+          sourceType: "MANUEL",
+          entryGroup,
+          createdById: input.createdById,
+        },
+      })
+    );
+  }
+  return results;
 }

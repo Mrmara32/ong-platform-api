@@ -20,7 +20,7 @@ invoicesRouter.get("/", async (req, res) => {
 const invoiceSchema = z.object({
   projectId: z.string().uuid().optional(),
   clientName: z.string().min(2),
-  currency: z.string().default("XOF"),
+  currency: z.enum(["GNF", "USD", "EUR"]).default("GNF"),
   dueDate: z.string(),
   lines: z.array(z.object({ description: z.string().min(2), quantity: z.number().positive().default(1), unitPrice: z.number().positive() })).min(1),
 });

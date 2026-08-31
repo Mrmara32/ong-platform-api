@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma";
 import { requireAuth, requireRole } from "../middleware/auth";
-import { recordPurchaseOrderDelivery, recordSupplierPayment } from "../services/accounting.service";
+import { recordPurchaseOrderDelivery, recordSupplierPayment, recordSupplierInvoiceReceived } from "../services/accounting.service";
 
 export const logisticsRouter = Router();
 logisticsRouter.use(requireAuth);
@@ -32,6 +32,11 @@ logisticsRouter.post("/suppliers", requireRole("ADMIN", "LOGISTICIEN"), async (r
 });
 
 // -------- Commandes / Achats --------
+//
+// Cycle complet : Logistique passe la commande (EN_ATTENTE_VALIDATION) →
+// Président valide ou rejette (VALIDEE / REJETEE) → réception physique
+// (LIVREE) → Comptable enregistre la facture fournisseur reçue
+// (FACTURE_RECUE, comptabilisée) → paiement (COMPTABILISEE).
 
 const orderSchema = z.object({
   projectId: z.string().uuid(),
@@ -44,7 +49,7 @@ const orderSchema = z.object({
 logisticsRouter.get("/purchase-orders", async (req, res) => {
   const orders = await prisma.purchaseOrder.findMany({
     where: { project: { organizationId: req.auth!.organizationId } },
-    include: { supplier: true, budgetLine: true },
+    include: { supplier: true, budgetLine: true, validatedBy: { select: { fullName: true } }, supplierInvoice: true },
     orderBy: { createdAt: "desc" },
   });
   res.json(orders);
@@ -57,20 +62,84 @@ logisticsRouter.post("/purchase-orders", requireRole("ADMIN", "LOGISTICIEN"), as
   res.status(201).json(order);
 });
 
-/**
- * Confirme la livraison d'une commande. C'est ce point d'API, et lui seul,
- * qui déclenche la comptabilisation automatique (cf. cahier des charges §2.5.1) :
- * écriture au plan comptable + mise à jour du disponible de la ligne budgétaire.
- */
-logisticsRouter.post("/purchase-orders/:id/deliver", requireRole("ADMIN", "LOGISTICIEN"), async (req, res) => {
+/** Validation de la commande par le Président/Admin — étape obligatoire avant tout envoi au fournisseur. */
+logisticsRouter.post("/purchase-orders/:id/validate", requireRole("ADMIN"), async (req, res) => {
   const order = await prisma.purchaseOrder.findFirst({
     where: { id: req.params.id, project: { organizationId: req.auth!.organizationId } },
   });
   if (!order) return res.status(404).json({ error: "Commande introuvable" });
-  if (order.status !== "COMMANDE") return res.status(409).json({ error: "Commande déjà traitée" });
+  if (order.status !== "EN_ATTENTE_VALIDATION") return res.status(409).json({ error: "Cette commande n'est pas en attente de validation" });
 
-  const updated = await recordPurchaseOrderDelivery(order.id, req.auth!.organizationId);
+  const updated = await prisma.purchaseOrder.update({
+    where: { id: order.id },
+    data: { status: "VALIDEE", validatedById: req.auth!.userId, validatedAt: new Date() },
+  });
   res.json(updated);
+});
+
+const rejectSchema = z.object({ reason: z.string().min(3, "Précise le motif du refus") });
+
+/** Rejet de la commande par le Président/Admin, avec motif obligatoire. */
+logisticsRouter.post("/purchase-orders/:id/reject", requireRole("ADMIN"), async (req, res) => {
+  const parsed = rejectSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const order = await prisma.purchaseOrder.findFirst({
+    where: { id: req.params.id, project: { organizationId: req.auth!.organizationId } },
+  });
+  if (!order) return res.status(404).json({ error: "Commande introuvable" });
+  if (order.status !== "EN_ATTENTE_VALIDATION") return res.status(409).json({ error: "Cette commande n'est pas en attente de validation" });
+
+  const updated = await prisma.purchaseOrder.update({
+    where: { id: order.id },
+    data: { status: "REJETEE", validatedById: req.auth!.userId, validatedAt: new Date(), rejectionReason: parsed.data.reason },
+  });
+  res.json(updated);
+});
+
+const deliverSchema = z.object({ deliveryNoteRef: z.string().optional() });
+
+/** Confirme la réception physique (bon de livraison + marchandise) d'une commande validée. */
+logisticsRouter.post("/purchase-orders/:id/deliver", requireRole("ADMIN", "LOGISTICIEN"), async (req, res) => {
+  const parsed = deliverSchema.safeParse(req.body ?? {});
+  const order = await prisma.purchaseOrder.findFirst({
+    where: { id: req.params.id, project: { organizationId: req.auth!.organizationId } },
+  });
+  if (!order) return res.status(404).json({ error: "Commande introuvable" });
+  if (order.status !== "VALIDEE") return res.status(409).json({ error: "La commande doit être validée par le Président avant réception" });
+
+  const updated = await recordPurchaseOrderDelivery(order.id, parsed.success ? parsed.data.deliveryNoteRef : undefined);
+  res.json(updated);
+});
+
+const supplierInvoiceSchema = z.object({
+  invoiceNumber: z.string().min(1),
+  amount: z.number().positive(),
+});
+
+/**
+ * Enregistrement de la facture fournisseur reçue — réservé au Comptable
+ * (et à l'Admin). C'est cet acte qui déclenche la comptabilisation de la
+ * dette envers le fournisseur (débit charge / crédit compte 401).
+ */
+logisticsRouter.post("/purchase-orders/:id/supplier-invoice", requireRole("ADMIN", "COMPTABLE"), async (req, res) => {
+  const parsed = supplierInvoiceSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const order = await prisma.purchaseOrder.findFirst({
+    where: { id: req.params.id, project: { organizationId: req.auth!.organizationId } },
+  });
+  if (!order) return res.status(404).json({ error: "Commande introuvable" });
+  if (order.status !== "LIVREE") return res.status(409).json({ error: "La commande doit être réceptionnée (bon de livraison) avant d'enregistrer la facture" });
+
+  const supplierInvoice = await recordSupplierInvoiceReceived({
+    organizationId: req.auth!.organizationId,
+    purchaseOrderId: order.id,
+    invoiceNumber: parsed.data.invoiceNumber,
+    amount: parsed.data.amount,
+    registeredById: req.auth!.userId,
+  });
+  res.status(201).json(supplierInvoice);
 });
 
 // -------- Stocks --------
@@ -143,6 +212,7 @@ const supplierPaymentSchema = z.object({
   amount: z.number().positive(),
   method: z.enum(["VIREMENT", "ORANGE_MONEY", "MTN_MONEY", "MOOV_MONEY", "WAVE", "ESPECES", "CHEQUE"]),
   reference: z.string().optional(),
+  purchaseOrderId: z.string().uuid().optional(), // clôture le cycle commande si le paiement correspond à une facture fournisseur enregistrée
 });
 
 /**
@@ -160,4 +230,123 @@ logisticsRouter.post("/supplier-payments", requireRole("ADMIN", "COMPTABLE", "LO
     ...parsed.data,
   });
   res.status(201).json(payment);
+});
+
+// -------- Demandes de consommables --------
+
+logisticsRouter.get("/consumable-requests", async (req, res) => {
+  const requests = await prisma.consumableRequest.findMany({
+    where: { organizationId: req.auth!.organizationId },
+    include: { requestedBy: { select: { fullName: true, jobTitle: true } } },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json(requests);
+});
+
+const consumableRequestSchema = z.object({
+  staffId: z.string().uuid(),
+  projectId: z.string().uuid().optional(),
+  itemName: z.string().min(1),
+  quantity: z.number().positive(),
+  unit: z.string().min(1),
+  justification: z.string().optional(),
+});
+
+/** Tout employé peut soumettre une demande de consommables — pas de restriction de rôle. */
+logisticsRouter.post("/consumable-requests", async (req, res) => {
+  const parsed = consumableRequestSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const request = await prisma.consumableRequest.create({
+    data: { ...parsed.data, organizationId: req.auth!.organizationId },
+  });
+  res.status(201).json(request);
+});
+
+const decideConsumableSchema = z.object({
+  status: z.enum(["APPROUVEE", "REFUSEE"]),
+  fulfilledFromStockItemId: z.string().uuid().optional(),
+});
+
+/**
+ * Décision sur une demande de consommables — réservée à la Logistique/Admin.
+ * Si servie depuis le stock, une sortie de stock est immédiatement générée ;
+ * sinon la demande reste tracée comme nécessitant une commande fournisseur.
+ */
+logisticsRouter.patch("/consumable-requests/:id", requireRole("ADMIN", "LOGISTICIEN"), async (req, res) => {
+  const parsed = decideConsumableSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const request = await prisma.consumableRequest.findFirst({
+    where: { id: req.params.id, organizationId: req.auth!.organizationId },
+  });
+  if (!request) return res.status(404).json({ error: "Demande introuvable" });
+
+  let finalStatus: string = parsed.data.status;
+
+  if (parsed.data.status === "APPROUVEE" && parsed.data.fulfilledFromStockItemId) {
+    await prisma.$transaction([
+      prisma.stockMovement.create({
+        data: {
+          stockItemId: parsed.data.fulfilledFromStockItemId,
+          type: "SORTIE",
+          quantity: request.quantity,
+          reason: `Demande de consommables — ${request.itemName}`,
+        },
+      }),
+      prisma.stockItem.update({
+        where: { id: parsed.data.fulfilledFromStockItemId },
+        data: { quantity: { decrement: request.quantity } },
+      }),
+    ]);
+    finalStatus = "SERVIE_STOCK";
+  } else if (parsed.data.status === "APPROUVEE") {
+    finalStatus = "COMMANDE_REQUISE";
+  }
+
+  const updated = await prisma.consumableRequest.update({
+    where: { id: request.id },
+    data: {
+      status: finalStatus as any,
+      approvedById: req.auth!.userId,
+      approvedAt: new Date(),
+      fulfilledFromStockItemId: parsed.data.fulfilledFromStockItemId,
+    },
+  });
+  res.json(updated);
+});
+
+// -------- Rapport de stock : situation et mouvements --------
+
+/** Situation actuelle du stock + historique complet des mouvements, pour un article ou pour tout l'inventaire. */
+logisticsRouter.get("/stock-report", async (req, res) => {
+  const { stockItemId } = req.query;
+  const items = await prisma.stockItem.findMany({
+    where: {
+      warehouse: { organizationId: req.auth!.organizationId },
+      ...(stockItemId ? { id: String(stockItemId) } : {}),
+    },
+    include: {
+      warehouse: { select: { name: true } },
+      movements: { orderBy: { date: "desc" } },
+    },
+  });
+
+  const report = items.map((item) => {
+    const entrees = item.movements.filter((m) => m.type === "ENTREE").reduce((s, m) => s + Number(m.quantity), 0);
+    const sorties = item.movements.filter((m) => m.type === "SORTIE").reduce((s, m) => s + Number(m.quantity), 0);
+    return {
+      id: item.id,
+      name: item.name,
+      unit: item.unit,
+      warehouse: item.warehouse.name,
+      currentQuantity: Number(item.quantity),
+      minQuantity: Number(item.minQuantity),
+      belowThreshold: Number(item.quantity) < Number(item.minQuantity),
+      totalEntrees: entrees,
+      totalSorties: sorties,
+      movements: item.movements,
+    };
+  });
+
+  res.json(report);
 });

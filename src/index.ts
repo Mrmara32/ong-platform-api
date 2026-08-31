@@ -14,6 +14,8 @@ import { equipmentRouter } from "./routes/equipment.routes";
 import { fleetRouter } from "./routes/fleet.routes";
 import { membersRouter } from "./routes/members.routes";
 import { organizationsRouter } from "./routes/organizations.routes";
+import { financialStatementsRouter } from "./routes/financial-statements.routes";
+import { paymentRequestsRouter, lettersRouter } from "./routes/payment-requests.routes";
 
 const app = express();
 app.use(cors());
@@ -38,6 +40,9 @@ app.use("/api/logistics", equipmentRouter);
 app.use("/api/fleet", fleetRouter);
 app.use("/api/members", membersRouter);
 app.use("/api/organizations", organizationsRouter);
+app.use("/api/financial-statements", financialStatementsRouter);
+app.use("/api/payment-requests", paymentRequestsRouter);
+app.use("/api/letters", lettersRouter);
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {

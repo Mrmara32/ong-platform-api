@@ -68,3 +68,50 @@ hrRouter.get("/projects/:projectId/staffing-cost", async (req, res) => {
   );
   res.json({ assignments, totalMonthlyCost });
 });
+
+// -------- Congés --------
+
+hrRouter.get("/leave-requests", async (req, res) => {
+  const requests = await prisma.leaveRequest.findMany({
+    where: { staff: { organizationId: req.auth!.organizationId } },
+    include: { staff: { select: { fullName: true, jobTitle: true } } },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json(requests);
+});
+
+const leaveRequestSchema = z.object({
+  staffId: z.string().uuid(),
+  type: z.enum(["CONGE_ANNUEL", "MALADIE", "MATERNITE_PATERNITE", "SANS_SOLDE", "AUTRE"]),
+  startDate: z.string(),
+  endDate: z.string(),
+  reason: z.string().optional(),
+});
+
+hrRouter.post("/leave-requests", async (req, res) => {
+  const parsed = leaveRequestSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const request = await prisma.leaveRequest.create({
+    data: { ...parsed.data, startDate: new Date(parsed.data.startDate), endDate: new Date(parsed.data.endDate) },
+  });
+  res.status(201).json(request);
+});
+
+const decideLeaveSchema = z.object({ status: z.enum(["APPROUVEE", "REFUSEE"]) });
+
+/** Décision sur une demande de congé — réservée à l'Admin/RH. */
+hrRouter.patch("/leave-requests/:id", requireRole("ADMIN", "RH"), async (req, res) => {
+  const parsed = decideLeaveSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+  const request = await prisma.leaveRequest.findFirst({
+    where: { id: req.params.id, staff: { organizationId: req.auth!.organizationId } },
+  });
+  if (!request) return res.status(404).json({ error: "Demande introuvable" });
+
+  const updated = await prisma.leaveRequest.update({
+    where: { id: request.id },
+    data: { status: parsed.data.status, decidedById: req.auth!.userId, decidedAt: new Date() },
+  });
+  res.json(updated);
+});
