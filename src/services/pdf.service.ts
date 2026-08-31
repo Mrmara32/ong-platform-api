@@ -415,3 +415,139 @@ export async function generateLetterPdfBuffer(letter: {
     doc.font("Helvetica-Bold").text(letter.signatoryName, { align: "right" });
   });
 }
+
+// ---------------------------------------------------------------------------
+// Rapport bailleur — formats UE / ONU / USAID
+// ---------------------------------------------------------------------------
+//
+// Reproduit la STRUCTURE et la TERMINOLOGIE habituelles de chaque type de
+// bailleur (résumé exécutif, cadre logique, exécution budgétaire...) — ce
+// n'est pas un gabarit officiel propriétaire d'une institution précise
+// (chaque bailleur peut exiger son propre modèle exact au cas par cas),
+// mais une structure fidèle aux conventions de rapportage les plus
+// courantes pour chaque type de bailleur.
+
+export type DonorReportFormat = "UE" | "ONU" | "USAID" | "GENERIQUE";
+
+const REPORT_SECTIONS: Record<DonorReportFormat, { title: string; narrative: string; indicators: string; budget: string; challenges: string }> = {
+  UE: {
+    title: "RAPPORT NARRATIF ET FINANCIER",
+    narrative: "1. Résumé exécutif",
+    indicators: "2. Cadre logique — indicateurs de résultat",
+    budget: "3. Rapport financier — exécution budgétaire",
+    challenges: "4. Difficultés rencontrées et mesures correctives",
+  },
+  ONU: {
+    title: "RAPPORT DE PROGRÈS — CADRE DE RÉSULTATS",
+    narrative: "1. Résumé narratif du programme",
+    indicators: "2. Progrès par rapport au cadre de résultats",
+    budget: "3. Utilisation financière des fonds",
+    challenges: "4. Défis rencontrés et enseignements tirés",
+  },
+  USAID: {
+    title: "RAPPORT DE PERFORMANCE",
+    narrative: "1. Executive Summary / Résumé exécutif",
+    indicators: "2. Progrès par indicateur (Performance Monitoring Plan)",
+    budget: "3. Rapport financier et analyse du pipeline budgétaire",
+    challenges: "4. Défis, mesures correctives et succès notables",
+  },
+  GENERIQUE: {
+    title: "RAPPORT D'AVANCEMENT DE PROJET",
+    narrative: "1. Résumé de l'avancement",
+    indicators: "2. Indicateurs de résultat",
+    budget: "3. Exécution budgétaire",
+    challenges: "4. Difficultés rencontrées",
+  },
+};
+
+export async function generateDonorReportPdfBuffer(input: {
+  format: DonorReportFormat;
+  periodLabel: string;
+  narrative: string;
+  challenges?: string;
+  project: { name: string; code: string; donor: string; grantNumber?: string | null; currency: string };
+  logframe: { objective: string; result: string; indicator: string; target: number; achieved: number }[];
+  budgetLines: { code: string; label: string; allocated: number; spent: number }[];
+  organization: OrganizationHeader;
+}): Promise<Buffer> {
+  const sections = REPORT_SECTIONS[input.format];
+
+  return toBuffer(async (doc) => {
+    await drawOrganizationHeader(doc, input.organization);
+
+    doc.fontSize(14).font("Helvetica-Bold").fillColor("#101B33").text(sections.title, { align: "center" });
+    doc.fontSize(10).font("Helvetica").fillColor("#3D4761").text(
+      `${input.project.name} (${input.project.code}) — ${input.periodLabel}`,
+      { align: "center" }
+    );
+    doc.fontSize(9).text(`Bailleur : ${input.project.donor}${input.project.grantNumber ? ` — N° ${input.project.grantNumber}` : ""}`, { align: "center" });
+    doc.moveDown(1.2);
+
+    const sectionTitle = (text: string) => {
+      doc.fontSize(11).font("Helvetica-Bold").fillColor("#101B33").text(text);
+      doc.moveTo(50, doc.y + 2).lineTo(545, doc.y + 2).strokeColor("#E4E7EE").stroke();
+      doc.moveDown(0.5);
+    };
+
+    sectionTitle(sections.narrative);
+    doc.fontSize(9).font("Helvetica").fillColor("#3D4761").text(input.narrative, { align: "justify", lineGap: 2 });
+    doc.moveDown(1);
+
+    sectionTitle(sections.indicators);
+    if (input.logframe.length === 0) {
+      doc.fontSize(9).fillColor("#9AA3B5").text("Aucun indicateur enregistré pour ce projet.");
+    } else {
+      const col1 = 50, col2 = 340, col3 = 420, col4 = 490;
+      doc.fontSize(8).font("Helvetica-Bold").fillColor("#101B33");
+      doc.text("Résultat / Indicateur", col1, doc.y, { width: 280 });
+      doc.text("Cible", col2, doc.y - 10, { width: 70, align: "right" });
+      doc.text("Atteint", col3, doc.y - 10, { width: 70, align: "right" });
+      doc.text("Taux", col4, doc.y - 10, { width: 55, align: "right" });
+      doc.moveDown(0.3);
+      doc.font("Helvetica").fillColor("#3D4761");
+      input.logframe.forEach((l) => {
+        const rate = l.target > 0 ? Math.round((l.achieved / l.target) * 100) : 0;
+        const y = doc.y;
+        doc.fontSize(8).text(`${l.result} — ${l.indicator}`, col1, y, { width: 280 });
+        doc.text(l.target.toLocaleString("fr-FR"), col2, y, { width: 70, align: "right" });
+        doc.text(l.achieved.toLocaleString("fr-FR"), col3, y, { width: 70, align: "right" });
+        doc.text(`${rate}%`, col4, y, { width: 55, align: "right" });
+        doc.moveDown(0.4);
+      });
+    }
+    doc.moveDown(0.8);
+
+    sectionTitle(sections.budget);
+    const totalAllocated = input.budgetLines.reduce((s, l) => s + l.allocated, 0);
+    const totalSpent = input.budgetLines.reduce((s, l) => s + l.spent, 0);
+    if (input.budgetLines.length === 0) {
+      doc.fontSize(9).fillColor("#9AA3B5").text("Aucune ligne budgétaire pour ce projet.");
+    } else {
+      doc.fontSize(8).font("Helvetica-Bold").fillColor("#101B33");
+      doc.text("Ligne budgétaire", 50, doc.y, { width: 260 });
+      doc.text("Alloué", 340, doc.y - 10, { width: 90, align: "right" });
+      doc.text("Dépensé", 440, doc.y - 10, { width: 105, align: "right" });
+      doc.moveDown(0.3);
+      doc.font("Helvetica").fillColor("#3D4761");
+      input.budgetLines.forEach((l) => {
+        const y = doc.y;
+        doc.fontSize(8).text(`${l.code} — ${l.label}`, 50, y, { width: 260 });
+        doc.text(l.allocated.toLocaleString("fr-FR"), 340, y, { width: 90, align: "right" });
+        doc.text(l.spent.toLocaleString("fr-FR"), 440, y, { width: 105, align: "right" });
+        doc.moveDown(0.4);
+      });
+      doc.moveDown(0.2);
+      doc.font("Helvetica-Bold").fillColor("#101B33");
+      const yTotal = doc.y;
+      doc.fontSize(8).text("TOTAL", 50, yTotal, { width: 260 });
+      doc.text(`${totalAllocated.toLocaleString("fr-FR")} ${input.project.currency}`, 340, yTotal, { width: 90, align: "right" });
+      doc.text(`${totalSpent.toLocaleString("fr-FR")} ${input.project.currency}`, 440, yTotal, { width: 105, align: "right" });
+    }
+    doc.moveDown(1);
+
+    if (input.challenges) {
+      sectionTitle(sections.challenges);
+      doc.fontSize(9).font("Helvetica").fillColor("#3D4761").text(input.challenges, { align: "justify", lineGap: 2 });
+    }
+  });
+}
